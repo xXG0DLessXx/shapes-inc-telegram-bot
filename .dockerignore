@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.git
+.gitignore
+.env # Crucial: Do NOT include your .env file with secrets in the Docker image
+venv/
+.DS_Store
+*.log
+logs/ # If you are logging to files and don't want old logs in the image

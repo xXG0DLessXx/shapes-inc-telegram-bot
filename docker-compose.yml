@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # --- Bot Instance 1: Nova ---
+  bot-nova-ai:
+    build: .
+    container_name: telegram_bot_nova-ai
+    restart: unless-stopped
+    env_file:
+      - common.env  # Loads common settings
+      - nova-ai.env    # Loads Nova's specific settings (and overrides common if needed)
+    # NO 'environment' block needed here for BOT_TOKEN or SHAPESINC_SHAPE_USERNAME
+    # unless you want to override something from nova-ai.env for a quick test,
+    # but generally keep secrets out of here.
+    network_mode: "host"
+
+  # --- Bot Instance 2: Amy ---
+  bot-discordaddictamy:
+    build: .
+    container_name: telegram_bot_discordaddictamy
+    restart: unless-stopped
+    env_file:
+      - common.env
+      - discordaddictamy.env
+    network_mode: "host"
+
+  # --- Add more bot instances as needed ---
+  # bot-anotherone:
+  #   build: .
+  #   container_name: telegram_bot_anotherone
+  #   restart: unless-stopped
+  #   env_file:
+  #     - common.env
+  #     - anotherone.env
+  #   network_mode: "host"
+
+# The 'volumes: - ./logs:/app/logs' from your original docker-compose.yml
+# was an example. Your bot currently logs to standard output (stdout/stderr),
+# which Docker captures automatically. You can view logs using `docker logs <container_name>`.
+# If you wanted each bot to write to separate log files on the host, you'd need
+# to configure volumes like:
+# volumes:
+#   - ./nova_logs:/app/logs # For bot-nova
+#   - ./amy_logs:/app/logs  # For bot-amy
+# And potentially modify bot.py to write to a file like /app/logs/bot.log,
+# or even better, /app/logs/${SHAPESINC_SHAPE_USERNAME}.log.
+# For simplicity, relying on Docker's stdout/stderr logging is recommended.
