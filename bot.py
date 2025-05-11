@@ -38,7 +38,6 @@ from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 
 # --- START OF MARKDOWNV2 ESCAPE CODE ---
-# ... (remains unchanged)
 _MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST = r"_*\[\]()~`#+\-=|{}.!"
 _MD_ESCAPE_REGEX_GENERAL = re.compile(r"([%s])" % re.escape(_MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST))
 _PLACEHOLDER_PREFIX = "zYzTgMdPhPrfxzYz"
@@ -155,7 +154,6 @@ def telegram_markdown_v2_escape(text: str) -> str:
 # --- END OF MARKDOWNV2 ESCAPE CODE ---
 
 # --- START OF INTELLIGENT SPLITTING CODE ---
-# ... (remains unchanged)
 _BALANCING_MARKDOWN_DELIMITERS = sorted(['||', '__', '*', '_', '~'], key=len, reverse=True)
 _MAX_DELIMITER_SEQUENCE_LEN = sum(len(d) for d in _BALANCING_MARKDOWN_DELIMITERS)
 _ATOMIC_ENTITY_REGEXES = [
@@ -271,7 +269,6 @@ def split_message_with_markdown_balancing(escaped_text: str, max_part_len: int, 
 # --- END OF INTELLIGENT SPLITTING CODE ---
 
 # --- Global Config & Setup ---
-# ... (remains unchanged)
 try:
     from BingImageCreator import ImageGen
     BING_IMAGE_CREATOR_AVAILABLE = True

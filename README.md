@@ -5,7 +5,7 @@ This project is a Python-based Telegram bot that leverages the Shapes.inc platfo
 The bot can:
 *   Engage in text-based conversations.
 *   Understand and respond to images sent by users.
-*   **Process voice messages sent by users (transcribes and responds).**
+*   Process voice messages sent by users.
 *   Utilize tools like a calculator, weather information, and web search.
 *   Potentially generate images using Bing Image Creator (this feature is experimental and may not be fully functional).
 *   In group chats, it can operate in a "free will" mode, occasionally interjecting into conversations based on recent message context.
@@ -15,7 +15,7 @@ The bot can:
 ## Features
 
 *   **Conversational AI:** Powered by Shapes.inc (via `openai` library targeting a custom base URL).
-*   **Multi-Modal Input:** Can process text, images, and **voice messages**.
+*   **Multi-Modal Input:** Can process text, images, and voice messages.
 *   **Tool Usage (Function Calling):**
     *   `calculator`: Evaluates mathematical expressions.
     *   `get_weather`: Fetches current, hourly, or daily weather forecasts.
