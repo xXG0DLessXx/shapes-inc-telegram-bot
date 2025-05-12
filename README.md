@@ -203,7 +203,7 @@ If you want to run a single bot instance locally without Docker:
 To interact with the bot, you can:
 *   Send it a direct message.
 *   Send it an image (with or without a caption).
-*   **Send it a voice message.**
+*   Send it a voice message.
 *   In group chats:
     *   Reply directly to one of the bot's messages.
     *   Mention the bot by its username (e.g., `@your_bot_username <your message>`).

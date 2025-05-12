@@ -348,7 +348,7 @@ async def create_poll_tool(
     options: List[str],
     is_anonymous: bool = True,
     allows_multiple_answers: bool = False,
-    # NEW parameters to be passed by the main handler:
+    # Parameters to be passed by the main handler:
     telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
     current_chat_id: Optional[int] = None
 ) -> str:
@@ -378,7 +378,6 @@ async def create_poll_tool(
         for opt_idx, opt_val in enumerate(unique_options):
             if len(opt_val) > 100:
                  return json.dumps({"error": f"Poll option #{opt_idx+1} ('{opt_val[:20]}...') is too long (max 100 characters)." })
-
 
         await telegram_bot_context.bot.send_poll(
             chat_id=current_chat_id,
@@ -468,7 +467,6 @@ def _get_specific_hour_forecast(
     timezone_str: str,
     unit_char: str
 ) -> Optional[Dict[str, Any]]:
-
     try:
         target_timezone = pytz.timezone(timezone_str)
     except pytz.exceptions.UnknownTimeZoneError:
@@ -480,7 +478,6 @@ def _get_specific_hour_forecast(
         return {"error": f"Requested hour {hours_ahead_target} is beyond forecast range."}
 
     idx = hours_ahead_target
-
     try:
         timestamp_str = hourly_data['time'][idx]
         dt_obj = datetime.fromisoformat(timestamp_str)
@@ -501,13 +498,11 @@ def _get_specific_hour_forecast(
         logger.error(f"Weather: Error processing specific hour forecast at index {idx}: {e}")
         return {"error": "Could not retrieve forecast for the specific hour."}
 
-
 def _format_hourly_weather(
     data: Dict[str, Any], unit: str, location_name: str,
     specific_hour: Optional[int], timezone_str: str, forecast_days: int
 ) -> Dict[str, Any]:
     u = unit[0].upper()
-
     if specific_hour is not None:
         forecast_data = _get_specific_hour_forecast(data, specific_hour, timezone_str, u)
         if forecast_data and "error" in forecast_data:
@@ -516,7 +511,6 @@ def _format_hourly_weather(
 
     forecasts = []
     num_entries_to_show = 24 * forecast_days
-
     try:
         target_timezone = pytz.timezone(timezone_str)
     except pytz.exceptions.UnknownTimeZoneError:
@@ -543,7 +537,6 @@ def _format_hourly_weather(
         except (IndexError, KeyError, ValueError) as e_item:
             logger.warning(f"Weather: Skipping hourly item at index {i} due to error: {e_item}")
             continue
-
     return {"location": location_name, "timeframe": "hourly", "forecasts": forecasts}
 
 def _format_daily_weather(data: Dict[str, Any], unit: str, location_name: str) -> Dict[str, Any]:
@@ -573,7 +566,6 @@ async def get_weather_tool(
     unit: str = 'celsius'
 ) -> str:
     logger.info(f"TOOL: get_weather_tool for {location}, timeframe: {timeframe}, hours: {hours_ahead}, days: {forecast_days}, unit: {unit}")
-
     async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
         try:
             geo_params = {'q': location, 'format': 'json', 'limit': 1}
@@ -631,7 +623,6 @@ async def get_weather_tool(
 
             result_data['coordinates'] = {'latitude': float(lat), 'longitude': float(lon)}
             return json.dumps(result_data)
-
         except httpx.HTTPStatusError as e:
             err_detail = f"HTTP error {e.response.status_code} calling {e.request.url}."
             try:
@@ -661,11 +652,9 @@ async def web_search(query: str, site: str = '', region: str = '', date_filter: 
         async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT, follow_redirects=True) as client:
             response = await client.get('https://duckduckgo.com/html/', params=params)
             response.raise_for_status()
-
         soup = BeautifulSoup(response.text, 'html.parser')
         results_list = []
         processed_results_count = 0
-
         for element_a in soup.select('.result__title a'):
             if processed_results_count >= 5: break # Limit to 5 results
             
@@ -715,7 +704,6 @@ async def web_search(query: str, site: str = '', region: str = '', date_filter: 
         final_payload_list = [f'Results for search query "{query}":']
         final_payload_list.extend(results_list) # Add the list of result dicts
         return json.dumps({'results': final_payload_list})
-
     except httpx.HTTPStatusError as e:
         logger.error(f"Web Search: HTTP error {e.response.status_code} for '{query}'. Resp: {e.response.text[:200]}", exc_info=False)
         return json.dumps({'error': f'Unable to perform web search: HTTP {e.response.status_code}'})
@@ -725,7 +713,6 @@ async def web_search(query: str, site: str = '', region: str = '', date_filter: 
     except Exception as e:
         logger.error(f"Web Search: Unexpected error during web search for '{query}': {e}", exc_info=True)
         return json.dumps({'error': 'An unexpected error occurred during web search.'})
-
 # --- END OF TOOL IMPLEMENTATIONS ---
 
 AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
@@ -881,7 +868,7 @@ async def handle_permission_denied(update: Update, context: ContextTypes.DEFAULT
 
 def get_llm_chat_history(chat_id: int) -> list[ChatCompletionMessageParam]:
     if chat_id not in chat_histories: chat_histories[chat_id] = []
-    if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH * 7: # Increased from * 2 to * 7 (user, assistant, tool_call, tool_result potentially)
+    if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH * 7: 
         logger.info(f"Trimming LLM chat history for {chat_id} from {len(chat_histories[chat_id])} to {MAX_HISTORY_LENGTH * 5}")
         chat_histories[chat_id] = chat_histories[chat_id][-(MAX_HISTORY_LENGTH * 5):]
     return chat_histories[chat_id]
@@ -928,7 +915,7 @@ def format_freewill_context_from_raw_log(
     formatted_context_parts.append(
         f"\n[You are '{bot_name}', chatting on Telegram. Based on the excerpt above, where '{triggering_user_name}' "
         f"just said: \"{triggering_message_text}\", "
-        "make a relevant and helpful interjection or comment. Be concise and natural.]"
+        "make a relevant and in character interjection or comment. Be concise and natural.]"
     )
     return "\n".join(formatted_context_parts) + "\n\n"
 
@@ -968,7 +955,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if ALLOWED_USERS and str(update.effective_user.id) in ALLOWED_USERS:
              help_text_parts.append("/setbingcookie <cookie_value> - (Admin) Update the Bing authentication cookie.")
 
-    help_text_parts.append("\nSimply send me a message, an image (with or without a caption), or a voice message to start chatting!") # Added voice message
+    help_text_parts.append("\nSimply send me a message, an image (with or without a caption), or a voice message to start chatting!") 
     if ENABLE_TOOL_USE and TOOL_DEFINITIONS_FOR_API:
         help_text_parts.append("\nI can also use tools like:")
         for tool_def in TOOL_DEFINITIONS_FOR_API:
@@ -1100,12 +1087,10 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
     user_message_text_original = update.message.text or ""
     user_message_caption_original = update.message.caption or ""
     
-    # MODIFIED: Determine a simple text representation for raw log, including voice
     current_message_content_for_raw_log = user_message_text_original or \
                                         user_message_caption_original or \
                                         ("[Image]" if update.message.photo else \
                                          ("[Voice Message]" if update.message.voice else "[Unsupported Message Type]"))
-
 
     if chat_type in [Chat.GROUP, Chat.SUPERGROUP]:
         add_to_raw_group_log(chat_id, get_display_name(current_user), current_message_content_for_raw_log)
@@ -1169,6 +1154,7 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         if chat_type in [Chat.GROUP, Chat.SUPERGROUP]:
             speaker_context_prefix = f"[User '{current_speaker_display_name}' (ID: {current_user.id}) on Telegram says:]\n"
 
+        replied_msg: Optional[TelegramMessage] = None 
         if update.message.reply_to_message:
             replied_msg = update.message.reply_to_message
             original_author_of_replied_msg = replied_msg.from_user
@@ -1183,7 +1169,7 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                 original_message_content_description = replied_msg.text or replied_msg.caption or \
                                                        ("[Image]" if replied_msg.photo else \
                                                         ("[Voice Message]" if replied_msg.voice else "[replied to non-text/photo/voice message]"))
-                max_original_content_len = 1024
+                max_original_content_len = 4096 # Allow longer context for replied messages
                 if len(original_message_content_description) > max_original_content_len:
                     original_message_content_description = original_message_content_description[:max_original_content_len].strip() + "..."
                 
@@ -1202,7 +1188,7 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         if is_mention_to_bot and bot_username_at in actual_user_text:
             cleaned_actual_text = re.sub(r'\s*' + re.escape(bot_username_at) + r'\s*', ' ', actual_user_text).strip()
             if not cleaned_actual_text and (user_message_text_original or user_message_caption_original):
-                actual_user_text = "(User addressed the bot directly)"
+                actual_user_text = "(You were addressed directly)"
             else:
                 actual_user_text = cleaned_actual_text
 
@@ -1222,19 +1208,20 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         if full_text_for_llm.strip():
             user_content_parts_for_llm.append({"type": "text", "text": full_text_for_llm.strip()})
 
-        has_image = False
+        has_image_from_current_message = False
+        has_voice_from_current_message = False
+
         if update.message.photo:
-            has_image = True
+            has_image_from_current_message = True
             photo_file = await update.message.photo[-1].get_file()
             file_bytes = await photo_file.download_as_bytearray()
             base64_image = base64.b64encode(file_bytes).decode('utf-8')
             mime_type = mimetypes.guess_type(photo_file.file_path or "img.jpg")[0] or 'image/jpeg'
             user_content_parts_for_llm.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}})
-            logger.info(f"Chat {chat_id}: Added image_url to LLM content.")
+            logger.info(f"Chat {chat_id}: Added image_url from current message to LLM content.")
 
-        has_voice = False
         if update.message.voice:
-            has_voice = True
+            has_voice_from_current_message = True
             voice: Voice = update.message.voice
             try:
                 voice_file = await voice.get_file()
@@ -1245,26 +1232,62 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                         "type": "audio_url",
                         "audio_url": {"url": voice_file.file_path}
                     })
-                    logger.info(f"Chat {chat_id}: Added audio_url to LLM content: {voice_file.file_path}")
+                    logger.info(f"Chat {chat_id}: Added audio_url from current message to LLM content: {voice_file.file_path}")
                 else:
-                    logger.warning(f"Chat {chat_id}: Could not get file_path for voice message.")
+                    logger.warning(f"Chat {chat_id}: Could not get file_path for current voice message.")
             except Exception as e_voice:
-                logger.error(f"Chat {chat_id}: Error processing voice message: {e_voice}", exc_info=True)
+                logger.error(f"Chat {chat_id}: Error processing current voice message: {e_voice}", exc_info=True)
+        
+        if replied_msg and not is_free_will_triggered and (is_mention_to_bot or is_direct_reply_to_bot):
+            if replied_msg.photo and not has_image_from_current_message:
+                try:
+                    photo_file_replied = await replied_msg.photo[-1].get_file()
+                    file_bytes_replied = await photo_file_replied.download_as_bytearray()
+                    base64_image_replied = base64.b64encode(file_bytes_replied).decode('utf-8')
+                    mime_type_replied = mimetypes.guess_type(photo_file_replied.file_path or "img.jpg")[0] or 'image/jpeg'
+                    if not any(p.get("type") == "image_url" for p in user_content_parts_for_llm):
+                        user_content_parts_for_llm.append({"type": "image_url", "image_url": {"url": f"data:{mime_type_replied};base64,{base64_image_replied}"}})
+                        logger.info(f"Chat {chat_id}: Added image_url from replied message to LLM content.")
+                        if not any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm):
+                            placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + "(Note: Image sent in the replied message)"
+                            user_content_parts_for_llm.insert(0, {"type": "text", "text": placeholder_text.strip()})
+                except Exception as e_img_replied:
+                    logger.error(f"Chat {chat_id}: Error processing replied image: {e_img_replied}", exc_info=True)
+
+            if replied_msg.voice and not has_voice_from_current_message:
+                try:
+                    voice_replied: Voice = replied_msg.voice
+                    voice_file_replied = await voice_replied.get_file()
+                    if voice_file_replied.file_path:
+                        if not any(p.get("type") == "audio_url" for p in user_content_parts_for_llm):
+                            user_content_parts_for_llm.append({
+                                "type": "audio_url",
+                                "audio_url": {"url": voice_file_replied.file_path}
+                            })
+                            logger.info(f"Chat {chat_id}: Added audio_url from replied message to LLM content: {voice_file_replied.file_path}")
+                            if not any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm):
+                                placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + "(Note: Audio sent in the replied message)"
+                                user_content_parts_for_llm.insert(0, {"type": "text", "text": placeholder_text.strip()})
+                    else:
+                        logger.warning(f"Chat {chat_id}: Could not get file_path for replied voice message.")
+                except Exception as e_voice_replied:
+                    logger.error(f"Chat {chat_id}: Error processing replied voice message: {e_voice_replied}", exc_info=True)
             
-        # If only media (image or voice) and no text part was formed, add a placeholder text part
-        if (has_image or has_voice) and not any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm):
-            placeholder_base_text = ""
-            if has_image and has_voice: # Unlikely to have both without any caption, but handle
-                placeholder_base_text = "(Note: Image and audio file are sent in this message)"
-            elif has_image:
-                placeholder_base_text = "(Note: An image is sent in this message)"
-            elif has_voice:
-                placeholder_base_text = "(Note: An audio file is sent in this message)"
+        final_has_any_media = any(p.get("type") in ["image_url", "audio_url"] for p in user_content_parts_for_llm)
+        final_has_any_text = any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm)
+
+        if final_has_any_media and not final_has_any_text:
+            placeholder_base_text = "(Note: Media present in message)" 
+            is_primarily_audio = any(p.get("type") == "audio_url" for p in user_content_parts_for_llm) and \
+                                 not any(p.get("type") == "image_url" for p in user_content_parts_for_llm)
+            is_primarily_image = any(p.get("type") == "image_url" for p in user_content_parts_for_llm) and \
+                                 not any(p.get("type") == "audio_url" for p in user_content_parts_for_llm)
+
+            if is_primarily_audio: placeholder_base_text = "(Note: An audio file is sent in this message)"
+            elif is_primarily_image: placeholder_base_text = "(Note: An image is sent in this message)"
             
-            if placeholder_base_text: # Only add if we have a specific media type
-                final_placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + placeholder_base_text
-                # Ensure it's inserted at the beginning if no other text part exists from user input
-                user_content_parts_for_llm.insert(0, {"type": "text", "text": final_placeholder_text.strip()})
+            final_placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + placeholder_base_text
+            user_content_parts_for_llm.insert(0, {"type": "text", "text": final_placeholder_text.strip()})
 
 
     if not user_content_parts_for_llm:
@@ -1295,15 +1318,12 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         # However, a final check if only media part(s) exist and no text part:
         if all(p.get("type") in ["image_url", "audio_url"] for p in final_llm_content) and \
            not any(p.get("type") == "text" for p in final_llm_content):
-            
             placeholder_text_for_lone_media = "Regarding the attached media:"
             if any(p.get("type") == "audio_url" for p in final_llm_content) and \
                not any(p.get("type") == "image_url" for p in final_llm_content):
                 placeholder_text_for_lone_media = "Please transcribe and respond to the attached audio message:"
-            
             final_placeholder_text_lone = (speaker_context_prefix or "") + (reply_context_prefix or "") + placeholder_text_for_lone_media
             final_llm_content.insert(0, {"type": "text", "text": final_placeholder_text_lone.strip()})
-
 
     llm_history.append({"role": "user", "content": final_llm_content})
     
@@ -1311,7 +1331,7 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
     if isinstance(final_llm_content, str):
         log_content_summary = f"Content (string): '{final_llm_content[:150].replace(chr(10), '/N')}...'"
     elif isinstance(final_llm_content, list):
-        # MODIFIED: Improved logging for multi-part including audio
+        # Improved logging for multi-part including audio
         part_summaries = []
         for p_idx, p_content in enumerate(final_llm_content):
             p_type = p_content.get("type", "unknown")
@@ -1353,7 +1373,6 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         while current_iteration < MAX_TOOL_ITERATIONS:
             current_iteration += 1
             messages_for_this_api_call = list(llm_history)
-
             api_params: Dict[str, Any] = {
                 "model": f"shapesinc/{SHAPESINC_SHAPE_USERNAME}",
                 "messages": messages_for_this_api_call
@@ -1464,12 +1483,11 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                                 parsed_args = json.loads(args_str)
                             else: 
                                 logger.warning(f"Chat {chat_id}: Tool '{func_name}' called with empty/null arguments string. Raw: '{args_str}'. Proceeding with empty dict if function allows.")
-                            
                             if not isinstance(parsed_args, dict): 
                                 raise TypeError(f"Parsed arguments for tool '{func_name}' are not a dictionary. Got {type(parsed_args)} from '{args_str}'")
                             
                             kwargs_for_tool = parsed_args.copy()
-                            if func_name == "create_poll_in_chat": # Example for poll tool
+                            if func_name == "create_poll_in_chat": 
                                 kwargs_for_tool["telegram_bot_context"] = context
                                 kwargs_for_tool["current_chat_id"] = chat_id
                             # Add similar blocks if other tools need context in the future
@@ -1739,7 +1757,6 @@ if __name__ == "__main__":
         app.add_handler(CommandHandler("setbingcookie", set_bing_cookie_command)) # Admin can set cookie even if not initially present
 
     # Message Handler for text, photos, voice, and replies (not commands)
-    # MODIFIED: Added filters.VOICE
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VOICE | filters.REPLY) & (~filters.COMMAND),
         process_message_entrypoint
