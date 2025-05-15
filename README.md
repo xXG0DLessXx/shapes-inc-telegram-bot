@@ -6,11 +6,16 @@ The bot can:
 *   Engage in text-based conversations.
 *   Understand and respond to images sent by users.
 *   Process voice messages sent by users.
-*   Utilize tools like a calculator, weather information, and web search.
+*   Utilize tools like a calculator, weather information, web search, and creating polls.
 *   Potentially generate images using Bing Image Creator (this feature is experimental and may not be fully functional).
-*   In group chats, it can operate in a "free will" mode, occasionally interjecting into conversations based on recent message context.
+*   **Support Telegram Group Topics:**
+    *   Maintain independent conversation histories per topic (and the general chat area) (THIS IS CURRENTLY NOT IMPLEMENTED BECAUSE SHAPES API DOES NOT USE THE OPENAI CONVERSATION HISTORY).
+    *   Operate its "free will" mode contextually within each topic.
+    *   Allow activation/deactivation for listening to all messages within a specific topic or the general group chat.
+    *   Target tools (like polls) to the specific topic where the command was issued.
+*   In group chats (including topics), it can operate in a "free will" mode, occasionally interjecting into conversations based on recent message context within that specific chat/topic.
 
-**Disclaimer:** This codebase is mostly the result of "vibe coding" and was developed rapidly, evolving from an older Poe.com Telegram bot. It's functional but should be considered "quick and dirty." Significant cleanup, refactoring, and more robust error handling would be beneficial for production use. Some features, like the Bing Image generation, might be unreliable or broken.
+**Disclaimer:** This codebase is mostly the result of "vibe coding" and was developed rapidly, evolving from an older Poe.com Telegram bot. While new features like topic support have been added, it's functional but should be considered "quick and dirty." Significant cleanup, refactoring, and more robust error handling would be beneficial for production use. Some features, like the Bing Image generation, might be unreliable or broken.
 
 ## Features
 
@@ -20,14 +25,22 @@ The bot can:
     *   `calculator`: Evaluates mathematical expressions.
     *   `get_weather`: Fetches current, hourly, or daily weather forecasts.
     *   `web_search`: Performs web searches using DuckDuckGo.
-    *   `create_poll_in_chat`: Creates a poll in current chat.
+    *   `create_poll_in_chat`: Creates a poll in the current chat/topic.
 *   **Image Generation (Experimental):** `/imagine` command using Bing Image Creator (requires `BING_AUTH_COOKIE`).
-*   **Group "Free Will" Mode:** Bot can spontaneously respond in group chats based on configurable probability and message context.
+*   **Telegram Group Topic Support:**
+    *   Independent conversation histories per topic (and general chat) (THIS DOES NOT WORK DUE TO HOW SHAPES API USES ITS OWN HISTORY).
+    *   Free will mode, `/newchat`, and tool usage are scoped to the current topic/general chat.
+    *   `/activate`: Bot listens to all messages in the current topic/general chat.
+    *   `/deactivate`: Bot stops listening to all messages, reverting to mentions/replies/free will.
+    *   Caches topic names for better contextual understanding.
+*   **Group "Free Will" Mode:** Bot can spontaneously respond in group chats/topics based on configurable probability and message context specific to that chat/topic.
 *   **User/Chat Whitelisting:** Restrict bot access to specific users or chats.
-*   **Conversation History Management:** `/newchat` command to clear context. (THIS IS NOT NEEDED BECAUSE Shapes, Inc. TAKES CARE OF CONTEXT ON THEIR SIDE! USE "!wack" OR OTHER SHAPE COMMANDS!)
+*   **Conversation History Management:** `/newchat` command to clear context for the current chat/topic. (Note: This does not work because Shapes.inc manages context on their side. Standard Shape commands like `!wack` might be more relevant for resetting context directly on their platform).
 *   **MarkdownV2 Support:** Advanced message formatting with intelligent splitting for long messages.
 *   **Dockerized Deployment:** Easily run multiple bot instances with `docker-compose`.
 *   **Dynamic Configuration:** Most settings are managed via environment variables.
+*   **Ignore Old Messages (Optional):** Can be configured to ignore messages received before the bot started up.
+*   **Dynamic Bot Commands:** Bot commands list in Telegram UI is updated on startup based on available features.
 
 ## Tech Stack
 
@@ -75,10 +88,13 @@ SHAPESINC_API_KEY=your_shapes_inc_api_key_here
 # Free will settings
 GROUP_FREE_WILL_ENABLED=true
 GROUP_FREE_WILL_PROBABILITY=0.05 # 0.05 is 5%
-GROUP_FREE_WILL_CONTEXT_MESSAGES=5
+GROUP_FREE_WILL_CONTEXT_MESSAGES=5 # Number of recent messages within the topic/chat to consider
 
 # Enable Tool Use
 ENABLE_TOOL_USE=true
+
+# Optional: Ignore messages older than bot startup time
+# IGNORE_OLD_MESSAGES_ON_STARTUP=false # Set to true to enable
 
 # Optional: Bing Image Creator Cookie (if you want to try /imagine)
 # BING_AUTH_COOKIE=your_bing_auth_cookie_here
@@ -139,6 +155,7 @@ If you want to run a single bot instance locally without Docker:
     # ... other common settings from env.example ...
     GROUP_FREE_WILL_ENABLED=true
     ENABLE_TOOL_USE=true
+    IGNORE_OLD_MESSAGES_ON_STARTUP=false
     # etc.
     ```
 
@@ -196,7 +213,9 @@ If you want to run a single bot instance locally without Docker:
 
 *   `/start`: Displays a welcome message.
 *   `/help`: Shows this help message, including available tools and free will status.
-*   `/newchat`: Clears the current conversation history with the bot, starting fresh. (Note: Shapes.inc often manages its own context. Standard Shape commands like `!wack` might be more relevant for resetting context on their end).
+*   `/newchat`: Clears the current conversation history with the bot for the current chat/topic, starting fresh. (Note: This does not work because Shapes.inc manages its own context. Standard Shape commands like `!wack` might be more relevant for resetting context on their end).
+*   `/activate`: (Groups/Topics only) Make the bot respond to every message in the current group (general chat) or specific topic.
+*   `/deactivate`: (Groups/Topics only) Stop the bot from responding to every message in the current group/topic, reverting to default behavior (mentions, replies, free will).
 *   `/imagine <prompt>`: (Experimental) Generates images based on your prompt using Bing Image Creator. Requires `BING_AUTH_COOKIE` to be set and `BingImageCreator` library to be functional.
 *   `/setbingcookie <cookie_value>`: (Admin-only) Updates the Bing authentication cookie. Restricted to users listed in `ALLOWED_USERS`.
 
@@ -204,18 +223,24 @@ To interact with the bot, you can:
 *   Send it a direct message.
 *   Send it an image (with or without a caption).
 *   Send it a voice message.
-*   In group chats:
+*   In group chats (including those with Topics):
     *   Reply directly to one of the bot's messages.
     *   Mention the bot by its username (e.g., `@your_bot_username <your message>`).
-    *   Wait for it to interject based on its "free will" settings (if enabled).
+    *   If in a group/topic where `/activate` has been used, the bot will respond to all messages in that specific context.
+    *   Wait for it to interject based on its "free will" settings for that specific chat/topic (if enabled).
 
 ## Important Notes & Known Issues
 
 *   **Code Quality:** As stated, this is "quick and dirty" code. It's functional but could benefit from significant refactoring, better error handling, and more structured logging.
 *   **Bing Image Generation (`/imagine`):** This feature relies on the `BingImageCreator` library and an authentication cookie. This method of accessing Bing Image Creator is unofficial and prone to breaking if Microsoft changes its authentication mechanisms. **It may not work reliably or at all.**
-*   **Voice Message Processing:** The bot sends the Telegram-provided URL for the voice message directly to the Shapes.inc API. The accessibility and processing of this URL by the API depend on Shapes.inc's capabilities. If transcription fails, it might be due to URL inaccessibility or unsupported audio formats (though Telegram typically uses `.oga` which is often compatible).
-*   **Error Handling:** While there's a general error handler, specific errors within tool execution or API calls might not always be gracefully reported to the user.
-*   **`network_mode: "host"` in Docker Compose:** This is used for simplicity in the provided `docker-compose.yml`. It means the containers share the host's network stack. For more isolated setups, you might consider removing it and managing port exposures if necessary (though not strictly needed for polling bots).
+*   **Voice Message Processing:** The bot sends the Telegram-provided URL for the voice message directly to the Shapes.inc API. The accessibility and processing of this URL by the API depend on Shapes.inc's capabilities.
+*   **Error Handling:** While there's a general error handler, specific errors within tool execution or API calls might not always be gracefully reported to the user. More detailed error propagation to the user could be improved.
+*   **Telegram Topic Support Details:**
+    *   Conversation history (`/newchat`), free will mode, and tool usage (e.g., polls) are scoped to individual topics within a group, or to the general chat area if topics are not used or the message is not in a topic.
+    *   The bot attempts to cache topic names when they are created or edited for more user-friendly logging and contextual prompts.
+    *   If `IGNORE_OLD_MESSAGES_ON_STARTUP` is set to `true`, the bot will skip processing messages (including topic creation/edit events for caching) that occurred before it started. This can be useful to prevent processing a backlog of messages on restart.
+*   **Typing Indicator in Groups with Topics:** The bot's typing indicator might not consistently show in the 'General' chat area of a group with topics when a user *replies* to a message (it typically works if the bot is directly pinged by its username in the reply). However, the typing indicator generally functions correctly within specific topics, in standard group chats (without topics), and in direct messages with the bot.
+*   **`network_mode: "host"` in Docker Compose:** This is used for simplicity in the provided `docker-compose.yml`. It means the containers share the host's network stack. For more isolated setups, you might consider removing it (though not strictly needed for polling bots if no direct inbound connections are required by the bot itself).
 *   **Security:** Be very careful with your API keys and bot tokens. Do not commit `.env` files containing secrets to public repositories. The whitelisting feature (`ALLOWED_USERS`, `ALLOWED_CHATS`) provides a basic level of access control.
 
 ## Contributing
@@ -231,10 +256,11 @@ This project was developed rapidly. If you wish to improve it:
 Focus areas for improvement could include:
 *   Refactoring `bot.py` into smaller, more manageable modules.
 *   Adding unit and integration tests.
-*   Improving error handling and user feedback.
+*   Improving error handling and user feedback, especially for tool failures.
 *   Stabilizing or replacing the Bing Image generation feature.
 *   Enhancing the toolset.
 *   Implementing a more robust voice message handling (e.g., downloading and re-hosting if direct URL access fails for the API).
+*   Improving the reliability of the typing indicator in all group/topic scenarios.
 
 ## License
 

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import logging
 import os
 import json
@@ -17,22 +15,22 @@ from typing import Dict, List, Tuple, Optional, Set, Union, Any
 
 # New imports for additional tools
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone # Added timezone for startup timestamp
 import pytz
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs, unquote as url_unquote
 
 
 # Telegram imports
-from telegram import Update, InputMediaPhoto, Message as TelegramMessage, User as TelegramUser, Chat, Voice
+from telegram import Update, InputMediaPhoto, Message as TelegramMessage, User as TelegramUser, Chat, Voice, Bot, BotCommand
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+    ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, Application
 )
 from telegram.constants import ChatAction, ParseMode
 import telegram.error
 
 # OpenAI imports
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, InternalServerError, APITimeoutError # Added InternalServerError, APITimeoutError
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
@@ -290,6 +288,9 @@ GROUP_FREE_WILL_ENABLED = os.getenv("GROUP_FREE_WILL_ENABLED", "false").lower() 
 GROUP_FREE_WILL_PROBABILITY_STR = os.getenv("GROUP_FREE_WILL_PROBABILITY", "0.0")
 GROUP_FREE_WILL_CONTEXT_MESSAGES_STR = os.getenv("GROUP_FREE_WILL_CONTEXT_MESSAGES", "3")
 
+IGNORE_OLD_MESSAGES_ON_STARTUP = os.getenv("IGNORE_OLD_MESSAGES_ON_STARTUP", "false").lower() == "true"
+BOT_STARTUP_TIMESTAMP: Optional[datetime] = None # Will be set in main
+
 try:
     GROUP_FREE_WILL_PROBABILITY = float(GROUP_FREE_WILL_PROBABILITY_STR)
     if not (0.0 <= GROUP_FREE_WILL_PROBABILITY <= 1.0):
@@ -333,14 +334,75 @@ try:
         logger.info(f"Group Free Will: ENABLED with probability {GROUP_FREE_WILL_PROBABILITY:.2%} and context of {GROUP_FREE_WILL_CONTEXT_MESSAGES} messages.")
     else:
         logger.info("Group Free Will: DISABLED.")
+    logger.info(f"Ignore old messages on startup: {'ENABLED' if IGNORE_OLD_MESSAGES_ON_STARTUP else 'DISABLED'}")
 except Exception as e:
     logger.error(f"Failed to init Shapes client: {e}"); raise
 
-chat_histories: dict[int, list[ChatCompletionMessageParam]] = {}
+# Stores conversation history per chat_id and thread_id tuple
+chat_histories: dict[tuple[int, Optional[int]], list[ChatCompletionMessageParam]] = {}
 MAX_HISTORY_LENGTH = 10
-group_raw_message_log: Dict[int, List[Dict[str, str]]] = {}
-MAX_RAW_LOG_PER_GROUP = 50
+# Stores raw messages (sender/text) per group chat_id and thread_id for free will context
+group_raw_message_log: Dict[int, Dict[Optional[int], List[Dict[str, str]]]] = {}
+MAX_RAW_LOG_PER_THREAD = 50 # Limit raw log size per topic/thread
+# Stores chat_id/thread_id tuples where the bot should always be active
+activated_chats_topics: Set[Tuple[int, Optional[int]]] = set()
+# --- Topic Name Cache ---
+topic_names_cache: Dict[Tuple[int, int], str] = {} # (chat_id, thread_id) -> topic_name
+MAX_TOPIC_ENTRIES_PER_CHAT_IN_CACHE = 200 
+chat_topic_cache_keys_order: Dict[int, List[Tuple[int, int]]] = {} 
 # --- END OF Global Config & Setup ---
+
+# --- NEW HELPER FUNCTION for sending messages with thread fallback ---
+async def send_message_to_chat_or_general(
+    bot_instance: Bot,
+    chat_id: int,
+    text: str,
+    preferred_thread_id: Optional[int],
+    parse_mode: Optional[str] = None,
+    **kwargs  # For other send_message params like reply_markup, disable_web_page_preview
+) -> Optional[TelegramMessage]:
+    """
+    Attempts to send a message to a preferred thread, falling back to the general chat
+    if the preferred thread is not found.
+    """
+    try:
+        return await bot_instance.send_message(
+            chat_id=chat_id,
+            text=text,
+            message_thread_id=preferred_thread_id,
+            parse_mode=parse_mode,
+            **kwargs
+        )
+    except telegram.error.BadRequest as e:
+        if "message thread not found" in e.message.lower() and preferred_thread_id is not None:
+            logger.warning(
+                f"Chat {chat_id}: Preferred thread {preferred_thread_id} not found for message. "
+                f"Attempting to send to general chat instead. Error: {e}"
+            )
+            try:
+                # Fallback: send to general chat (message_thread_id=None)
+                return await bot_instance.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    message_thread_id=None, # Explicitly None for general chat
+                    parse_mode=parse_mode,
+                    **kwargs
+                )
+            except telegram.error.BadRequest as e2:
+                # If sending to general also fails with BadRequest (could be for other reasons now)
+                logger.error(f"Chat {chat_id}: Sending to general chat also failed with BadRequest. Error: {e2}")
+                raise e2 # Re-raise the second error
+            except Exception as e_general_unexpected:
+                logger.error(f"Chat {chat_id}: Unexpected error sending to general chat. Error: {e_general_unexpected}")
+                raise e_general_unexpected # Re-raise
+        else:
+            # Different BadRequest error, or preferred_thread_id was already None
+            raise e # Re-raise original error
+    except Exception as e_other_send:
+        # Catch any other non-BadRequest errors during send
+        logger.error(f"Chat {chat_id} (thread {preferred_thread_id}): Unexpected error during send_message. Error: {e_other_send}")
+        raise e_other_send
+# --- END OF NEW HELPER FUNCTION ---
 
 # --- TOOL IMPLEMENTATIONS ---
 async def create_poll_tool(
@@ -350,15 +412,17 @@ async def create_poll_tool(
     allows_multiple_answers: bool = False,
     # Parameters to be passed by the main handler:
     telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
-    current_chat_id: Optional[int] = None
+    current_chat_id: Optional[int] = None,
+    current_message_thread_id: Optional[int] = None # Added thread ID
 ) -> str:
-    logger.info(f"TOOL: create_poll_tool for chat_id {current_chat_id} with question='{question}', options={options}")
+    logger.info(f"TOOL: create_poll_tool for chat_id {current_chat_id} (thread_id: {current_message_thread_id}) with question='{question}', options={options}")
 
     if not telegram_bot_context or not current_chat_id:
         err_msg = "Telegram context or chat ID not provided to create_poll_tool."
         logger.error(err_msg)
         return json.dumps({"error": err_msg, "details": "This tool requires internal context to function."})
 
+    # Validation
     if not question or not isinstance(question, str) or len(question.strip()) == 0:
         return json.dumps({"error": "Poll question cannot be empty."})
     if not options or not isinstance(options, list) or len(options) < 2 or len(options) > 10:
@@ -378,26 +442,55 @@ async def create_poll_tool(
         for opt_idx, opt_val in enumerate(unique_options):
             if len(opt_val) > 100:
                  return json.dumps({"error": f"Poll option #{opt_idx+1} ('{opt_val[:20]}...') is too long (max 100 characters)." })
-
+        
+        # Attempt to send poll to the specific thread
         await telegram_bot_context.bot.send_poll(
             chat_id=current_chat_id,
             question=question,
             options=unique_options,
             is_anonymous=is_anonymous,
-            allows_multiple_answers=allows_multiple_answers
+            allows_multiple_answers=allows_multiple_answers,
+            message_thread_id=current_message_thread_id # Pass the thread ID
         )
-        logger.info(f"Poll sent to chat {current_chat_id}: '{question}'")
+        logger.info(f"Poll sent to chat {current_chat_id} (thread {current_message_thread_id}): '{question}'")
         return json.dumps({
             "status": "poll_created_successfully",
             "question": question,
             "options_sent": unique_options,
-            "chat_id": current_chat_id
+            "chat_id": current_chat_id,
+            "message_thread_id": current_message_thread_id
         })
     except telegram.error.BadRequest as e:
-        logger.error(f"Telegram BadRequest creating poll in chat {current_chat_id}: {e}", exc_info=True)
-        return json.dumps({"error": "Failed to create poll.", "details": f"Telegram API error: {e.message}"})
+        # Check if this BadRequest is due to thread not found for polls
+        if "message thread not found" in e.message.lower() and current_message_thread_id is not None:
+            logger.warning(f"Poll for chat {current_chat_id}, thread {current_message_thread_id} failed (thread not found). Retrying in general chat.")
+            try:
+                # Fallback: Send poll to general chat
+                await telegram_bot_context.bot.send_poll(
+                    chat_id=current_chat_id,
+                    question=question,
+                    options=unique_options,
+                    is_anonymous=is_anonymous,
+                    allows_multiple_answers=allows_multiple_answers,
+                    message_thread_id=None # Fallback to general
+                )
+                logger.info(f"Poll sent to chat {current_chat_id} (GENERAL after thread fail): '{question}'")
+                return json.dumps({
+                    "status": "poll_created_successfully_in_general_after_thread_fail",
+                    "question": question,
+                    "options_sent": unique_options,
+                    "chat_id": current_chat_id,
+                    "message_thread_id": None
+                })
+            except Exception as e2:
+                logger.error(f"Error creating poll in general chat (fallback) for {current_chat_id}: {e2}", exc_info=True)
+                return json.dumps({"error": "Failed to create poll in thread and general.", "details": f"Telegram API error: {e2.message if hasattr(e2, 'message') else str(e2)}"})
+        else:
+            # Different BadRequest error
+            logger.error(f"Telegram BadRequest creating poll in chat {current_chat_id} (thread {current_message_thread_id}): {e}", exc_info=True)
+            return json.dumps({"error": "Failed to create poll.", "details": f"Telegram API error: {e.message}"})
     except Exception as e:
-        logger.error(f"Unexpected error in create_poll_tool for chat {current_chat_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error in create_poll_tool for chat {current_chat_id} (thread {current_message_thread_id}): {e}", exc_info=True)
         return json.dumps({"error": "An unexpected error occurred while trying to create the poll.", "details": str(e)})
 
 async def calculator_tool(expression: str) -> str:
@@ -713,7 +806,6 @@ async def web_search(query: str, site: str = '', region: str = '', date_filter: 
     except Exception as e:
         logger.error(f"Web Search: Unexpected error during web search for '{query}': {e}", exc_info=True)
         return json.dumps({'error': 'An unexpected error occurred during web search.'})
-# --- END OF TOOL IMPLEMENTATIONS ---
 
 AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
     "calculator": calculator_tool,
@@ -783,7 +875,7 @@ TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for information on a given topic. Fetches only the first page of search results from DuckDuckGo. Use when you require information you are unsure or unaware of.",
+            "description": "Search the web/online/on the internet for information on a given topic. Fetches only the first page of search results from DuckDuckGo. Use when you require information you are unsure or unaware of.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -864,40 +956,106 @@ def is_user_or_chat_allowed(user_id: int, chat_id: int) -> bool:
 
 async def handle_permission_denied(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Sorry, you are not authorized to use this command or interact with me.")
+        message_thread_id: Optional[int] = None
+        if update.message and update.message.message_thread_id is not None:
+            message_thread_id = update.message.message_thread_id
+        # Use the new helper for sending
+        try:
+            await send_message_to_chat_or_general(
+                context.bot,
+                update.effective_chat.id,
+                "Sorry, you are not authorized to use this command or interact with me.",
+                preferred_thread_id=message_thread_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to send permission denied message to {update.effective_chat.id} (thread {message_thread_id}): {e}")
 
-def get_llm_chat_history(chat_id: int) -> list[ChatCompletionMessageParam]:
-    if chat_id not in chat_histories: chat_histories[chat_id] = []
-    if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH * 7: 
-        logger.info(f"Trimming LLM chat history for {chat_id} from {len(chat_histories[chat_id])} to {MAX_HISTORY_LENGTH * 5}")
-        chat_histories[chat_id] = chat_histories[chat_id][-(MAX_HISTORY_LENGTH * 5):]
-    return chat_histories[chat_id]
 
-def add_to_raw_group_log(chat_id: int, sender_name: str, text: str):
+def get_llm_chat_history(chat_id: int, message_thread_id: Optional[int]) -> list[ChatCompletionMessageParam]:
+    # (Code adjusted for thread_id, comments from old version not directly applicable)
+    history_key = (chat_id, message_thread_id)
+    if history_key not in chat_histories:
+        chat_histories[history_key] = []
+    
+    current_thread_history = chat_histories[history_key]
+    # Trim history if it gets excessively long (more aggressive than just MAX_HISTORY_LENGTH)
+    if len(current_thread_history) > MAX_HISTORY_LENGTH * 7: 
+        trimmed_length = MAX_HISTORY_LENGTH * 5 # Trim down significantly
+        logger.info(f"Trimming LLM chat history for chat {chat_id} (thread {message_thread_id}) from {len(current_thread_history)} to {trimmed_length}")
+        chat_histories[history_key] = current_thread_history[-trimmed_length:]
+    return chat_histories[history_key]
+
+def add_to_raw_group_log(chat_id: int, message_thread_id: Optional[int], sender_name: str, text: str):
+    # (Code adjusted for thread_id, comments from old version not directly applicable)
     if chat_id not in group_raw_message_log:
-        group_raw_message_log[chat_id] = []
+        group_raw_message_log[chat_id] = {}
+    if message_thread_id not in group_raw_message_log[chat_id]:
+        group_raw_message_log[chat_id][message_thread_id] = []
+    
     log_entry = {"sender_name": sender_name, "text": text if text else "[empty message content]"}
-    group_raw_message_log[chat_id].append(log_entry)
-    if len(group_raw_message_log[chat_id]) > MAX_RAW_LOG_PER_GROUP:
-        group_raw_message_log[chat_id] = group_raw_message_log[chat_id][-MAX_RAW_LOG_PER_GROUP:]
-        logger.debug(f"Trimmed raw message log for group {chat_id} to {len(group_raw_message_log[chat_id])} messages.")
+    current_thread_log = group_raw_message_log[chat_id][message_thread_id]
+    current_thread_log.append(log_entry)
+    
+    # Trim the log for the specific thread if it exceeds the limit
+    if len(current_thread_log) > MAX_RAW_LOG_PER_THREAD:
+        group_raw_message_log[chat_id][message_thread_id] = current_thread_log[-MAX_RAW_LOG_PER_THREAD:]
+    
+    topic_desc = f"topic ID {message_thread_id}" if message_thread_id is not None else "general chat"
+    # Reduced log level for this frequent message
+    logger.debug(f"Raw message log for group {chat_id} ({topic_desc}) updated. Length: {len(group_raw_message_log[chat_id][message_thread_id])} messages.")
+
 
 def format_freewill_context_from_raw_log(
     chat_id: int,
+    message_thread_id: Optional[int], # Added thread ID
     num_messages_to_include: int,
-    bot_name: str
-    ) -> str:
-    if chat_id not in group_raw_message_log or not group_raw_message_log[chat_id] or num_messages_to_include <= 0:
-        return "[Recent conversation context is minimal or unavailable.]\n"
-    log = group_raw_message_log[chat_id]
+    bot_name: str,
+    current_chat_title: Optional[str],
+    current_topic_name_if_known: Optional[str] 
+) -> str:
+    # Build a descriptive location string
+    location_description_parts = []
+    if current_chat_title:
+        location_description_parts.append(f"group '{current_chat_title}'")
+    else: # Fallback if title not passed or None (should ideally always be passed for groups)
+        location_description_parts.append(f"a group chat (ID: {chat_id})")
+
+    if message_thread_id is not None: # This is the topic ID for the raw log
+        if current_topic_name_if_known: # If resolved and passed from process_message_entrypoint
+            location_description_parts.append(f"topic '{current_topic_name_if_known}'")
+        # No need to check cache here again if current_topic_name_if_known is the primary way to pass it
+        else: # Fallback if not explicitly passed (e.g. cache miss in process_message_entrypoint)
+            # Try to get from cache as a last resort for free will prompt
+            cached_topic_name = topic_names_cache.get((chat_id, message_thread_id))
+            if cached_topic_name:
+                location_description_parts.append(f"topic '{cached_topic_name}'")
+            else:
+                location_description_parts.append(f"topic ID {message_thread_id} (name not resolved)")
+    elif current_chat_title : # In a group, but not a specific topic (general area)
+        location_description_parts.append("the general chat area")
+    # For private chats, message_thread_id will be None, current_chat_title might be None or user's name
+
+    topic_desc_log = "this chat" # Default for private chats or if somehow no group info
+    if location_description_parts:
+        topic_desc_log = " ".join(location_description_parts)
+    
+    # Check if log exists for the chat AND the specific thread
+    if chat_id not in group_raw_message_log or \
+       message_thread_id not in group_raw_message_log.get(chat_id, {}) or \
+       not group_raw_message_log[chat_id].get(message_thread_id) or \
+       num_messages_to_include <= 0:
+        return f"[Recent conversation context for this group's {topic_desc_log} is minimal or unavailable.]\n"
+    
+    log = group_raw_message_log[chat_id][message_thread_id] # Get log for the specific thread
     start_index = max(0, len(log) - num_messages_to_include)
     context_messages_to_format = log[start_index:]
-    if not context_messages_to_format:
-         return "[No prior messages in raw log to form context.]\n"
 
-    formatted_context_parts = ["[Recent conversation excerpt:]"]
-    triggering_user_name = "Unknown User"
-    triggering_message_text = "[message content not available]"
+    if not context_messages_to_format:
+         return f"[No prior messages in raw log for this group's {topic_desc_log} to form context.]\n"
+
+    formatted_context_parts = [f"[Recent conversation excerpt from {topic_desc_log}:]"]
+    triggering_user_name = "Unknown User" # Default value
+    triggering_message_text = "[message content not available]" # Default value
 
     for i, msg_data in enumerate(context_messages_to_format):
         sender = msg_data.get("sender_name", "Unknown User")
@@ -906,49 +1064,154 @@ def format_freewill_context_from_raw_log(
         if len(text) > max_len_per_msg_in_context:
             text = text[:max_len_per_msg_in_context].strip() + "..."
         formatted_context_parts.append(f"- '{sender}' said: \"{text}\"")
-        if i == len(context_messages_to_format) - 1:
+        # Capture the last message details
+        if i == len(context_messages_to_format) - 1: 
             triggering_user_name = sender
-            triggering_message_text = msg_data.get("text", "[message content not available]")
-            if len(triggering_message_text) > 500:
+            triggering_message_text = msg_data.get("text", "[message content not available]") 
+            # Truncate if the triggering message text itself is very long
+            if len(triggering_message_text) > 500: 
                 triggering_message_text = triggering_message_text[:500].strip() + "..."
-
+    
+    # Include the topic description in the final prompt
     formatted_context_parts.append(
-        f"\n[You are '{bot_name}', chatting on Telegram. Based on the excerpt above, where '{triggering_user_name}' "
+        f"\n[You are '{bot_name}', chatting on Telegram in {topic_desc_log}. Based on the excerpt above, where '{triggering_user_name}' "
         f"just said: \"{triggering_message_text}\", "
         "make a relevant and in character interjection or comment. Be concise and natural.]"
     )
     return "\n".join(formatted_context_parts) + "\n\n"
 
-async def _keep_typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: str = ChatAction.TYPING, interval: float = 4.5):
+async def _keep_typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_thread_id: Optional[int], action: str = ChatAction.TYPING, interval: float = 4.5):
     while True:
         try:
-            await context.bot.send_chat_action(chat_id=chat_id, action=action)
+            await context.bot.send_chat_action(chat_id=chat_id, action=action, message_thread_id=message_thread_id)
             await asyncio.sleep(interval)
         except asyncio.CancelledError: break
+        except telegram.error.BadRequest as e:
+            # Handle case where the thread might have been deleted while typing
+            if "message thread not found" in e.message.lower() and message_thread_id is not None:
+                logger.warning(f"Typing loop: Thread {message_thread_id} not found for chat {chat_id}. Stopping typing for this thread.")
+                break # Stop trying for this specific (now invalid) thread
+            logger.warning(f"Error sending {action} action in loop for chat {chat_id} (thread {message_thread_id}): {e}")
+            await asyncio.sleep(interval) # Continue loop even on other BadRequest errors, but log it
         except Exception as e:
-            logger.warning(f"Error sending {action} action in loop for chat {chat_id}: {e}")
-            await asyncio.sleep(interval) # Continue loop even on error, but log it
+            logger.warning(f"Error sending {action} action in loop for chat {chat_id} (thread {message_thread_id}): {e}")
+            await asyncio.sleep(interval) # Continue loop even on other errors, but log it
 # --- END OF UTILITY FUNCTIONS ---
+
+# --- Status Update Handler for Forum Topics (to populate cache) ---
+async def handle_forum_topic_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        logger.debug("Forum topic update lacks message or effective_chat. Skipping.")
+        return
+        
+    # Ignore old status updates if feature is enabled
+    if IGNORE_OLD_MESSAGES_ON_STARTUP and BOT_STARTUP_TIMESTAMP:
+        message_date_utc = update.message.date # Status update messages also have a date
+        if message_date_utc.tzinfo is None:
+            message_date_utc = message_date_utc.replace(tzinfo=dt_timezone.utc)
+        else:
+            message_date_utc = message_date_utc.astimezone(dt_timezone.utc)
+        if message_date_utc < BOT_STARTUP_TIMESTAMP:
+            logger.info(f"Ignoring old forum topic update (MsgID: {update.message.message_id}) from before bot startup.")
+            return
+
+    chat_id = update.effective_chat.id
+    # Topic events are always tied to a specific message_thread_id for created/edited
+    thread_id: Optional[int] = update.message.message_thread_id 
+    
+    topic_name_to_cache: Optional[str] = None
+    action_taken: Optional[str] = None
+
+    if update.message.forum_topic_created and thread_id is not None:
+        topic_name_to_cache = update.message.forum_topic_created.name
+        action_taken = "created"
+    elif update.message.forum_topic_edited and thread_id is not None:
+        # The `name` field in `forum_topic_edited` is the *new* name
+        topic_name_to_cache = update.message.forum_topic_edited.name
+        action_taken = "edited"
+    
+    if topic_name_to_cache is not None and thread_id is not None:
+        key = (chat_id, thread_id)
+        old_name = topic_names_cache.get(key)
+        
+        topic_names_cache[key] = topic_name_to_cache
+        
+        # Manage cache order for pruning
+        if chat_id not in chat_topic_cache_keys_order:
+            chat_topic_cache_keys_order[chat_id] = []
+        if key in chat_topic_cache_keys_order[chat_id]:
+            chat_topic_cache_keys_order[chat_id].remove(key) # Move to end if re-edited
+        chat_topic_cache_keys_order[chat_id].append(key)
+        
+        # Prune if cache for this chat_id exceeds limit
+        if len(chat_topic_cache_keys_order[chat_id]) > MAX_TOPIC_ENTRIES_PER_CHAT_IN_CACHE:
+            key_to_remove = chat_topic_cache_keys_order[chat_id].pop(0) # Remove oldest
+            if key_to_remove in topic_names_cache:
+                removed_name = topic_names_cache.pop(key_to_remove)
+                logger.info(f"Pruned oldest topic '{removed_name}' (Key: {key_to_remove}) from cache for chat {chat_id} due to size limit.")
+
+        if action_taken == "created":
+            logger.info(f"Topic '{topic_name_to_cache}' (ID: {thread_id}) {action_taken} in chat {chat_id}. Cached.")
+        elif action_taken == "edited": # Log edit only if name changed or for debug
+            if old_name != topic_name_to_cache :
+                 logger.info(f"Topic ID {thread_id} in chat {chat_id} renamed from '{old_name}' to '{topic_name_to_cache}'. Cache updated.")
+            else:
+                 logger.debug(f"Topic ID {thread_id} in chat {chat_id} edited but name ('{topic_name_to_cache}') unchanged. Cache refreshed.")
 
 # --- COMMAND HANDLERS ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat: return
+    if not update.message or not update.effective_chat or not update.effective_user: return
+    
+    # Check if the command is specifically for this bot in group chats
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context); return
+    
+    message_thread_id: Optional[int] = None
+    if update.message and update.message.message_thread_id is not None:
+        message_thread_id = update.message.message_thread_id
+
     start_message = (
         f"Hello! I am {SHAPESINC_SHAPE_USERNAME}, chatting here on Telegram! "
         "I can chat, use tools, and even understand images and voice messages.\n\n"
         "Type /help to see a list of commands."
     )
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=start_message)
+    try:
+        # Use helper to send, respecting thread ID
+        await send_message_to_chat_or_general(
+            context.bot, update.effective_chat.id, start_message, preferred_thread_id=message_thread_id
+        )
+    except Exception as e:
+        logger.error(f"Failed to send start message to {update.effective_chat.id} (thread {message_thread_id}): {e}")
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat: return
+    if not update.message or not update.effective_chat or not update.effective_user: return
+
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+            
+    message_thread_id: Optional[int] = None
+    if update.message and update.message.message_thread_id is not None:
+        message_thread_id = update.message.message_thread_id
+        
     help_text_parts = [
         "Here are the available commands:",
         "/start - Display the welcome message.",
         "/help - Show this help message.",
-        "/newchat - Clear the current conversation history and start fresh."
+        "/newchat - Clear the current conversation history (for this topic/chat) and start fresh.",
+        "/activate - (Groups/Topics only) Make me respond to every message in this specific group/topic.",
+        "/deactivate - (Groups/Topics only) Stop me from responding to every message (revert to mentions/replies/free will)."
     ]
     if BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE:
         help_text_parts.append("/imagine <prompt> - Generate images based on your prompt using Bing.")
@@ -965,52 +1228,110 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 help_text_parts.append(f"  - `{func_info['name']}`: {desc_first_sentence}")
 
     if GROUP_FREE_WILL_ENABLED and update.effective_chat and update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
-        help_text_parts.append(f"\nGroup Free Will is enabled! I might respond randomly about {GROUP_FREE_WILL_PROBABILITY:.1%} of the time, considering the last ~{GROUP_FREE_WILL_CONTEXT_MESSAGES} messages.")
+        # Adjusted comment for thread awareness
+        help_text_parts.append(f"\nGroup Free Will is enabled! I might respond randomly about {GROUP_FREE_WILL_PROBABILITY:.1%} of the time, considering the last ~{GROUP_FREE_WILL_CONTEXT_MESSAGES} messages in this specific topic/chat.")
 
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         help_text_parts.append("\n\nNote: Your access to interact with me is currently restricted.")
 
     escaped_help_text = telegram_markdown_v2_escape("\n".join(help_text_parts))
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=escaped_help_text, parse_mode=ParseMode.MARKDOWN_V2)
+    try:
+        # Use helper to send, respecting thread ID
+        await send_message_to_chat_or_general(
+            context.bot, update.effective_chat.id, escaped_help_text,
+            preferred_thread_id=message_thread_id, parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except Exception as e:
+         logger.error(f"Failed to send help message to {update.effective_chat.id} (thread {message_thread_id}): {e}")
+         # Fallback to plain text if MDv2 fails for reasons other than thread not found (handled by helper)
+         try:
+            # Use helper for plain text fallback as well
+            await send_message_to_chat_or_general(
+                context.bot, update.effective_chat.id, "\n".join(help_text_parts), # Send unescaped for plain
+                preferred_thread_id=message_thread_id
+            )
+         except Exception as e2:
+            logger.error(f"Failed to send plain text help fallback to {update.effective_chat.id} (thread {message_thread_id}): {e2}")
+
 
 async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat or not update.message: return
+    if not update.message or not update.effective_chat or not update.effective_user: return
+
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context); return
+
     chat_id = update.effective_chat.id
+    message_thread_id: Optional[int] = None
+    if update.message.message_thread_id is not None:
+        message_thread_id = update.message.message_thread_id
+    
+    # Key for history/log now includes thread_id
+    history_key = (chat_id, message_thread_id)
+    topic_desc = f"topic ID {message_thread_id}" if message_thread_id is not None else "general chat"
     cleared_any = False
-    if chat_id in chat_histories and chat_histories[chat_id]:
-        chat_histories[chat_id] = []
-        logger.info(f"LLM Conversation history cleared for chat ID: {chat_id}")
-        cleared_any = True
-    if chat_id in group_raw_message_log: # Also clear raw log if it exists for the chat
-        group_raw_message_log[chat_id] = []
-        logger.info(f"Raw group message log cleared for chat ID: {chat_id}")
+
+    # Clear LLM history for this specific thread/chat
+    if history_key in chat_histories and chat_histories[history_key]:
+        chat_histories[history_key] = []
+        logger.info(f"LLM Conversation history cleared for chat ID: {chat_id} ({topic_desc})")
         cleared_any = True
     
-    if cleared_any:
-        await update.message.reply_text("✨ Conversation history cleared! Let's start a new topic.")
-    else:
-        await update.message.reply_text("There's no conversation history to clear yet.")
+    # Also clear raw log if it exists for the chat and thread
+    if chat_id in group_raw_message_log:
+        if message_thread_id in group_raw_message_log.get(chat_id, {}):
+            if group_raw_message_log[chat_id][message_thread_id]: # Check if the thread log is non-empty
+                group_raw_message_log[chat_id][message_thread_id] = []
+                logger.info(f"Raw group message log cleared for chat ID: {chat_id} ({topic_desc})")
+                cleared_any = True
+    
+    # Use topic-aware message
+    reply_text = "✨ Conversation history for this topic/chat cleared! Let's start a new topic." if cleared_any else "There's no conversation history for this topic/chat to clear yet."
+    # update.message.reply_text automatically handles the thread_id
+    await update.message.reply_text(reply_text)
+
 
 async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_chat or not update.message: return
+    if not update.message or not update.effective_chat or not update.effective_user: return
+
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+            
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context); return
+    
+    # reply_text handles thread_id automatically
     if not (BING_IMAGE_CREATOR_AVAILABLE and ImageGen and BING_AUTH_COOKIE):
-        await update.message.reply_text("The /imagine command is currently unavailable or not configured. Please contact an admin."); return
-    if not context.args: await update.message.reply_text("Please provide a prompt for the image. Usage: /imagine <your image prompt>"); return
+        await update.message.reply_text("The /imagine command is currently unavailable or not configured. Please contact an admin."); return 
+    if not context.args: 
+        await update.message.reply_text("Please provide a prompt for the image. Usage: /imagine <your image prompt>"); return
 
     prompt = " ".join(context.args)
     chat_id=update.effective_chat.id
+    message_thread_id: Optional[int] = None
+    if update.message.message_thread_id is not None:
+        message_thread_id = update.message.message_thread_id
+
     typing_task: Optional[asyncio.Task] = None
     status_msg: Optional[TelegramMessage] = None
     temp_dir = f"temp_bing_images_{chat_id}_{random.randint(1000,9999)}" # Unique temp dir
 
     try:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
-        typing_task = asyncio.create_task(_keep_typing_loop(context, chat_id, action=ChatAction.UPLOAD_PHOTO, interval=5.0))
-        status_msg = await update.message.reply_text(f"🎨 Working on your vision: \"{prompt[:50]}...\" (using Bing)")
+        # Send initial action respecting thread_id
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO, message_thread_id=message_thread_id)
+        typing_task = asyncio.create_task(_keep_typing_loop(context, chat_id, message_thread_id, action=ChatAction.UPLOAD_PHOTO, interval=5.0))
+        # Reply handles thread_id automatically
+        status_msg = await update.message.reply_text(f"🎨 Working on your vision: \"{prompt[:50]}...\" (using Bing)") 
 
         image_gen = ImageGen(auth_cookie=BING_AUTH_COOKIE) # Uses the global BING_AUTH_COOKIE
         image_links = await asyncio.to_thread(image_gen.get_images, prompt)
@@ -1039,20 +1360,23 @@ async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if typing_task: typing_task.cancel(); typing_task=None # Cancel before sending media
 
         if media_photos:
-            await context.bot.send_media_group(chat_id=chat_id, media=media_photos)
+            # send_media_group needs explicit thread_id
+            await context.bot.send_media_group(chat_id=chat_id, media=media_photos, message_thread_id=message_thread_id)
             if status_msg: await status_msg.delete() # Clean up status message
         else:
             err_msg_no_proc = "Sorry, no images could be processed or sent from Bing."
             if status_msg: await status_msg.edit_text(err_msg_no_proc)
-            else: await update.message.reply_text(err_msg_no_proc)
+            else: await update.message.reply_text(err_msg_no_proc) # Fallback reply
 
     except Exception as e:
         logger.error(f"Error during /imagine command for prompt '{prompt}': {e}", exc_info=True)
         err_text = "An error occurred while generating images with Bing. Please try again later."
         try:
             if status_msg: await status_msg.edit_text(err_text)
-            else: await context.bot.send_message(chat_id, err_text) # Fallback if status_msg failed to send
-        except Exception: await context.bot.send_message(chat_id, err_text) # Ultimate fallback
+            # Use helper for direct send fallback
+            else: await send_message_to_chat_or_general(context.bot, chat_id, err_text, preferred_thread_id=message_thread_id) 
+        except Exception: # Ultimate fallback if editing/sending fails
+            await send_message_to_chat_or_general(context.bot, chat_id, err_text, preferred_thread_id=message_thread_id)
     finally:
         if typing_task and not typing_task.done(): typing_task.cancel()
         if os.path.exists(temp_dir): # Cleanup temp directory
@@ -1060,9 +1384,18 @@ async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e_clean: logger.error(f"Error cleaning up temporary directory {temp_dir}: {e_clean}")
 
 async def set_bing_cookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message: return
+    if not update.message or not update.effective_user: return
+
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+
     user_id_str = str(update.effective_user.id)
-    if not (ALLOWED_USERS and user_id_str in ALLOWED_USERS and BING_IMAGE_CREATOR_AVAILABLE): # Check admin and feature availability
+    # Check admin and feature availability
+    if not (ALLOWED_USERS and user_id_str in ALLOWED_USERS and BING_IMAGE_CREATOR_AVAILABLE): 
         await update.message.reply_text("This command is restricted to authorized administrators or is currently unavailable."); return
     if not context.args or len(context.args) != 1:
         await update.message.reply_text("Usage: /setbingcookie <new_cookie_value>"); return
@@ -1071,7 +1404,72 @@ async def set_bing_cookie_command(update: Update, context: ContextTypes.DEFAULT_
     global BING_AUTH_COOKIE
     BING_AUTH_COOKIE = new_cookie
     logger.info(f"BING_AUTH_COOKIE updated by admin: {user_id_str}")
+    # Reply handles thread ID
     await update.message.reply_text("Bing authentication cookie has been updated for the /imagine command.")
+
+async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user: return
+
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+            
+    if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
+        await handle_permission_denied(update, context); return
+
+    if update.effective_chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+        await update.message.reply_text("The /activate command can only be used in groups or supergroups.")
+        return
+
+    chat_id = update.effective_chat.id
+    message_thread_id: Optional[int] = update.message.message_thread_id # Can be None for general group chat
+
+    chat_topic_key = (chat_id, message_thread_id)
+    topic_desc = f"this topic (ID: {message_thread_id})" if message_thread_id is not None else "this group's general chat"
+
+    if chat_topic_key in activated_chats_topics:
+        reply_text = f"I am already actively listening in {topic_desc}."
+    else:
+        activated_chats_topics.add(chat_topic_key)
+        reply_text = f"✅ Activated! I will now respond to all messages in {topic_desc}."
+        logger.info(f"Bot activated for chat {chat_id} ({topic_desc}) by user {update.effective_user.id}")
+    
+    await update.message.reply_text(reply_text) # reply_text handles thread_id
+
+async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user: return
+
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        command_parts = update.message.text.split(' ', 1)
+        command_with_potential_mention = command_parts[0]
+        if "@" in command_with_potential_mention and f"@{context.bot.username}" not in command_with_potential_mention:
+            logger.info(f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring.")
+            return
+
+    if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
+        await handle_permission_denied(update, context); return
+
+    if update.effective_chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+        await update.message.reply_text("The /deactivate command can only be used in groups or supergroups.")
+        return
+
+    chat_id = update.effective_chat.id
+    message_thread_id: Optional[int] = update.message.message_thread_id
+
+    chat_topic_key = (chat_id, message_thread_id)
+    topic_desc = f"this topic (ID: {message_thread_id})" if message_thread_id is not None else "this group's general chat"
+
+    if chat_topic_key in activated_chats_topics:
+        activated_chats_topics.remove(chat_topic_key)
+        reply_text = f"💤 Deactivated. I will no longer respond to all messages in {topic_desc}. (I'll still respond to mentions, replies, or free will)."
+        logger.info(f"Bot deactivated for chat {chat_id} ({topic_desc}) by user {update.effective_user.id}")
+    else:
+        reply_text = f"I was not actively listening to all messages in {topic_desc} anyway."
+        
+    await update.message.reply_text(reply_text) # reply_text handles thread_id
 # --- END OF COMMAND HANDLERS ---
 
 # --- Main Message Handler ---
@@ -1080,95 +1478,217 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         logger.debug("Update is missing essential message, chat, or user. Ignoring.")
         return
 
+    # --- Ignore old messages if feature is enabled ---
+    if IGNORE_OLD_MESSAGES_ON_STARTUP and BOT_STARTUP_TIMESTAMP:
+        # Ensure message date is UTC for comparison
+        message_date_utc = update.message.date
+        if message_date_utc.tzinfo is None: # Should not happen with Telegram messages
+            message_date_utc = message_date_utc.replace(tzinfo=dt_timezone.utc)
+        else:
+            message_date_utc = message_date_utc.astimezone(dt_timezone.utc)
+
+        if message_date_utc < BOT_STARTUP_TIMESTAMP:
+            logger.info(f"Ignoring old message (ID: {update.message.message_id}, Date: {message_date_utc}) from chat {update.effective_chat.id} received before bot startup ({BOT_STARTUP_TIMESTAMP}).")
+            return
+    # --- End of ignore old messages ---
+
     current_user = update.effective_user
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     
+    # Get message thread ID if it exists
+    current_message_thread_id: Optional[int] = None
+    if update.message.message_thread_id is not None:
+        current_message_thread_id = update.message.message_thread_id
+    
     user_message_text_original = update.message.text or ""
     user_message_caption_original = update.message.caption or ""
     
+    # Determine content for raw log entry
     current_message_content_for_raw_log = user_message_text_original or \
                                         user_message_caption_original or \
                                         ("[Image]" if update.message.photo else \
                                          ("[Voice Message]" if update.message.voice else "[Unsupported Message Type]"))
 
+    # Log raw message if in a group/supergroup context, respecting thread ID
     if chat_type in [Chat.GROUP, Chat.SUPERGROUP]:
-        add_to_raw_group_log(chat_id, get_display_name(current_user), current_message_content_for_raw_log)
+        add_to_raw_group_log(chat_id, current_message_thread_id, get_display_name(current_user), current_message_content_for_raw_log)
 
+    # Check permissions
     if not is_user_or_chat_allowed(current_user.id, chat_id):
-        logger.warning(f"Ignoring message from non-allowed user ID {current_user.id} in chat ID {chat_id}")
+        logger.warning(f"Ignoring message from non-allowed user ID {current_user.id} in chat ID {chat_id} (thread {current_message_thread_id})")
         return
 
-    llm_history = get_llm_chat_history(chat_id)
+    # Get conversation history specific to this chat and thread
+    llm_history = get_llm_chat_history(chat_id, current_message_thread_id)
     user_content_parts_for_llm: List[Dict[str, Any]] = []
     
+    # Context and trigger flags
     speaker_context_prefix = ""
     reply_context_prefix = ""
     should_process_message = False
     is_direct_reply_to_bot = False
     is_mention_to_bot = False
     is_free_will_triggered = False
+    is_activated_chat_topic = False # New flag
     
     bot_username_at = f"@{context.bot.username}"
     text_for_trigger_check = user_message_text_original or user_message_caption_original
 
+    # Determine if the bot should process this message based on chat type and content
     if chat_type in [Chat.GROUP, Chat.SUPERGROUP]:
-        if update.message.reply_to_message and \
+        current_chat_topic_key = (chat_id, current_message_thread_id)
+        # Check if this specific chat/topic is activated
+        if current_chat_topic_key in activated_chats_topics:
+            is_activated_chat_topic = True
+            should_process_message = True
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Processing message because this chat/topic is activated.")
+
+        # Check if it's a direct reply to the bot (even if not activated)
+        if not should_process_message and update.message.reply_to_message and \
            update.message.reply_to_message.from_user and \
            update.message.reply_to_message.from_user.id == context.bot.id:
             is_direct_reply_to_bot = True; should_process_message = True
-            logger.info(f"Chat {chat_id}: Message is a direct reply to the bot.")
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Message is a direct reply to the bot.")
 
+        # Check if the bot is mentioned (even if not activated or replied to)
         if not should_process_message and bot_username_at in text_for_trigger_check:
             is_mention_to_bot = True; should_process_message = True
-            logger.info(f"Chat {chat_id}: Bot was mentioned.")
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Bot was mentioned.")
 
+        # Check for free will trigger if enabled AND not already set to process by other means
         if not should_process_message and GROUP_FREE_WILL_ENABLED and GROUP_FREE_WILL_PROBABILITY > 0:
             if random.random() < GROUP_FREE_WILL_PROBABILITY:
                 is_free_will_triggered = True; should_process_message = True
-                logger.info(f"Chat {chat_id}: Free will triggered! (Prob: {GROUP_FREE_WILL_PROBABILITY:.2%}, Context: {GROUP_FREE_WILL_CONTEXT_MESSAGES} msgs)")
+                logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Free will triggered! (Prob: {GROUP_FREE_WILL_PROBABILITY:.2%}, Context: {GROUP_FREE_WILL_CONTEXT_MESSAGES} msgs)")
             else:
-                logger.debug(f"Chat {chat_id}: Free will not triggered this time.")
+                logger.debug(f"Chat {chat_id} (thread {current_message_thread_id}): Free will not triggered this time.")
         
+        # If none of the above, ignore the message in groups
         if not should_process_message:
-            logger.debug(f"Message in group {chat_id} not for bot. Ignoring.")
+            logger.debug(f"Message in group {chat_id} (thread {current_message_thread_id}) not for bot. Ignoring.")
             return
             
-    elif chat_type == Chat.PRIVATE:
+    elif chat_type == Chat.PRIVATE: # Always process messages in private chats
         should_process_message = True
-    else:
+    else: # Ignore other chat types like channels
         logger.debug(f"Message in unhandled chat_type '{chat_type}'. Ignoring.")
         return
 
+    # --- Start building the user message content for the LLM ---
     current_speaker_display_name = get_display_name(current_user)
+    # --- Get known topic name for context for both free will and direct interaction ---
+    known_topic_name_for_context: Optional[str] = None
+    if current_message_thread_id is not None and chat_type in [Chat.GROUP, Chat.SUPERGROUP]: # Only relevant for group topics
+        known_topic_name_for_context = topic_names_cache.get((chat_id, current_message_thread_id))
+    # --- END MODIFICATION ---
 
     if is_free_will_triggered:
+        # Generate context prompt based on raw log for the specific thread
         free_will_prompt = format_freewill_context_from_raw_log(
             chat_id,
+            current_message_thread_id, # Pass thread ID
             GROUP_FREE_WILL_CONTEXT_MESSAGES,
-            context.bot.username or SHAPESINC_SHAPE_USERNAME
+            context.bot.username or SHAPESINC_SHAPE_USERNAME,
+            update.effective_chat.title, # Pass current chat title
+            known_topic_name_for_context # Pass known topic name resolved above
+
         )
         if free_will_prompt.strip():
              user_content_parts_for_llm.append({"type": "text", "text": free_will_prompt})
-    else: # Direct interaction (DM, reply, mention) or voice/image message
+    else:
+        # Direct interaction (DM, reply, mention, activated chat) or voice/image message
+        # Add speaker context in groups (unless it's a free will, which is handled above)
+        # --- Build location_addon_for_speaker_prefix ---
+        location_addon_for_speaker_prefix = ""
         if chat_type in [Chat.GROUP, Chat.SUPERGROUP]:
-            speaker_context_prefix = f"[User '{current_speaker_display_name}' (ID: {current_user.id}) on Telegram says:]\n"
+            chat_location_description_parts = []
+            group_title = update.effective_chat.title 
+            if group_title:
+                chat_location_description_parts.append(f"in group '{group_title}'")
+        
+            if update.message.is_topic_message and current_message_thread_id is not None:
+                # Use the 'known_topic_name_for_context' resolved earlier
+                if known_topic_name_for_context:
+                    chat_location_description_parts.append(f"with topic name '{known_topic_name_for_context}'")
+                else: # Fallback if topic name not in cache
+                    chat_location_description_parts.append(f"with topic ID '{current_message_thread_id}' (failed to get topic name)") # Use ID as fallback
+            elif group_title : 
+                 chat_location_description_parts.append("the general chat area")
 
+            if chat_location_description_parts:
+                location_addon_for_speaker_prefix = f" {' '.join(chat_location_description_parts)}"
+        elif chat_type == Chat.PRIVATE:
+            location_addon_for_speaker_prefix = " in a private chat"
+        # --- END MODIFICATION ---
+
+        # Apply the location addon to the speaker prefix
+        speaker_context_prefix = f"[User '{current_speaker_display_name}' (ID: {current_user.id}) on Telegram{location_addon_for_speaker_prefix} says:]\n"
+
+        # Add reply context if applicable
         replied_msg: Optional[TelegramMessage] = None 
         if update.message.reply_to_message:
             replied_msg = update.message.reply_to_message
-            original_author_of_replied_msg = replied_msg.from_user
-            generate_this_reply_context = False
-            if original_author_of_replied_msg and original_author_of_replied_msg.id == context.bot.id:
+            original_author_of_replied_msg = replied_msg.from_user # Can be None for some service messages
+            generate_this_reply_context = False # Default to False
+
+            is_explicit_reply_to_our_bot = original_author_of_replied_msg and original_author_of_replied_msg.id == context.bot.id
+
+            if is_explicit_reply_to_our_bot:
                 generate_this_reply_context = True
-            elif is_mention_to_bot and update.message.reply_to_message: # Also add context if mentioning bot while replying to someone else
-                generate_this_reply_context = True
+            elif (is_mention_to_bot or is_activated_chat_topic) and replied_msg:
+                # This branch means:
+                #   - The bot was mentioned OR it's an activated chat/topic.
+                #   - AND the current message is a reply to *some* previous message.
+
+                # Check if the replied-to message is a type of service message we want to ignore
+                # for context generation *specifically when the bot was pinged*.
+                # For activated chats, we might still want context even if replying to a service message.
+                is_ignorable_service_message = False
+                if replied_msg: # Ensure replied_msg is not None
+                    # List of common service message attributes to check
+                    service_message_attributes = [
+                        replied_msg.forum_topic_created, replied_msg.forum_topic_reopened,
+                        replied_msg.forum_topic_edited, replied_msg.forum_topic_closed,
+                        replied_msg.general_forum_topic_hidden, replied_msg.general_forum_topic_unhidden,
+                        replied_msg.write_access_allowed, replied_msg.group_chat_created,
+                        replied_msg.supergroup_chat_created, replied_msg.message_auto_delete_timer_changed,
+                        replied_msg.migrate_to_chat_id, replied_msg.migrate_from_chat_id,
+                        replied_msg.pinned_message, replied_msg.new_chat_members,
+                        replied_msg.left_chat_member, replied_msg.new_chat_title,
+                        replied_msg.new_chat_photo, replied_msg.delete_chat_photo,
+                        replied_msg.video_chat_scheduled, replied_msg.video_chat_started,
+                        replied_msg.video_chat_ended, replied_msg.video_chat_participants_invited,
+                        replied_msg.web_app_data
+                        # Add other specific service attributes if needed
+                    ]
+                    if any(attr is not None for attr in service_message_attributes):
+                        is_ignorable_service_message = True
+                
+                if is_mention_to_bot and is_ignorable_service_message:
+                    # This is a PING, and the auto-reply (from Telegram client, or user explicitly replying to service msg)
+                    # is to an ignorable service message. We don't want to generate reply context based on this service message
+                    # for a simple ping, as it's usually not relevant to the ping's intent.
+                    logger.info(
+                        f"Chat {chat_id} (thread {current_message_thread_id}): Bot pinged. "
+                        f"'reply_to_message' (ID: {replied_msg.message_id if replied_msg else 'N/A'}) "
+                        f"is an ignorable service message. Suppressing this from reply context for the ping."
+                    )
+                    generate_this_reply_context = False # Explicitly keep it false for this scenario
+                else:
+                    # It's either:
+                    # 1. A reply to a normal user/bot message (and bot is mentioned/activated)
+                    # 2. An activated chat message (not a ping) that happens to be replying to any message (service or not)
+                    # 3. A ping replying to a normal user/bot message (not an ignorable service message)
+                    generate_this_reply_context = True
             
-            if generate_this_reply_context:
+            if generate_this_reply_context and replied_msg: # Ensure replied_msg is not None again
                 original_author_display_name = get_display_name(original_author_of_replied_msg)
+                # Use the user's original structure for description
                 original_message_content_description = replied_msg.text or replied_msg.caption or \
                                                        ("[Image]" if replied_msg.photo else \
                                                         ("[Voice Message]" if replied_msg.voice else "[replied to non-text/photo/voice message]"))
+                
                 max_original_content_len = 4096 # Allow longer context for replied messages
                 if len(original_message_content_description) > max_original_content_len:
                     original_message_content_description = original_message_content_description[:max_original_content_len].strip() + "..."
@@ -1181,36 +1701,54 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                     f"[Replying to {original_author_identifier} which said: \"{original_message_content_description}\"]\n"
                 )
         
+        # Process the actual text/caption from the user's message
         actual_user_text = ""
         if user_message_text_original: actual_user_text = user_message_text_original
         elif user_message_caption_original: actual_user_text = user_message_caption_original
         
+        # Clean mention if present (and not an activated chat processing a non-mention message)
         if is_mention_to_bot and bot_username_at in actual_user_text:
-            cleaned_actual_text = re.sub(r'\s*' + re.escape(bot_username_at) + r'\s*', ' ', actual_user_text).strip()
-            if not cleaned_actual_text and (user_message_text_original or user_message_caption_original):
+            # Replace only the first occurrence of the bot's username, case-insensitively, then strip.
+            # This handles cases like "@botname some text" or "some text @botname more text".
+            # Using re.IGNORECASE ensures it works regardless of how user types the bot name.
+            # Using count=1 ensures only the first explicit mention is removed if there are multiple.
+            cleaned_actual_text = re.sub(r'\s*' + re.escape(bot_username_at) + r'\s*', ' ', actual_user_text, count=1, flags=re.IGNORECASE).strip()
+            
+            # If after removing the mention, the text is empty or just whitespace,
+            # AND the original message had text/caption (meaning it wasn't just an image/voice with mention),
+            # then use a placeholder.
+            if not cleaned_actual_text.strip() and (user_message_text_original or user_message_caption_original):
                 actual_user_text = "(You were addressed directly)"
             else:
                 actual_user_text = cleaned_actual_text
 
+        # Combine context prefixes and user text
         full_text_for_llm = ""
         if speaker_context_prefix: full_text_for_llm += speaker_context_prefix
         if reply_context_prefix: full_text_for_llm += reply_context_prefix
         
-        if actual_user_text:
+        if actual_user_text: # Append the (potentially cleaned) user text
             full_text_for_llm += actual_user_text
-        elif (speaker_context_prefix or reply_context_prefix) and not (update.message.photo or update.message.voice):
-             # Only add this if there's no other content like photo/voice and some context prefix exists
-            if update.message.reply_to_message and not (user_message_text_original or user_message_caption_original):
+        # Add placeholder if context exists but no user text/media, e.g., user replied with just a sticker
+        elif (speaker_context_prefix or reply_context_prefix) and \
+             not (update.message.photo or update.message.voice or actual_user_text.strip()): # Check actual_user_text.strip() here
+            # This means some context (speaker or reply) was generated, but the current message itself
+            # provided no new text, caption, photo, or voice.
+            if replied_msg and not (user_message_text_original or user_message_caption_original): # Check original text for this part
+                 # This specific placeholder is from your original code.
                  full_text_for_llm += "(User replied without new text/caption)"
-            # else: # This case is less likely to be meaningful without media
-            #      full_text_for_llm += "(User sent a message without new text/caption)"
+            # else: # Other cases of empty message with context are less common or might not need a placeholder.
+            #     pass 
         
+        # Add the combined text part if it's not empty
         if full_text_for_llm.strip():
             user_content_parts_for_llm.append({"type": "text", "text": full_text_for_llm.strip()})
 
+        # --- Handle Media (Image/Voice) ---
         has_image_from_current_message = False
         has_voice_from_current_message = False
 
+        # Add image from the current message
         if update.message.photo:
             has_image_from_current_message = True
             photo_file = await update.message.photo[-1].get_file()
@@ -1218,8 +1756,9 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             base64_image = base64.b64encode(file_bytes).decode('utf-8')
             mime_type = mimetypes.guess_type(photo_file.file_path or "img.jpg")[0] or 'image/jpeg'
             user_content_parts_for_llm.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}})
-            logger.info(f"Chat {chat_id}: Added image_url from current message to LLM content.")
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Added image_url from current message to LLM content.")
 
+        # Add voice message URL from the current message
         if update.message.voice:
             has_voice_from_current_message = True
             voice: Voice = update.message.voice
@@ -1232,52 +1771,75 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                         "type": "audio_url",
                         "audio_url": {"url": voice_file.file_path}
                     })
-                    logger.info(f"Chat {chat_id}: Added audio_url from current message to LLM content: {voice_file.file_path}")
+                    logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Added audio_url from current message to LLM content: {voice_file.file_path}")
                 else:
-                    logger.warning(f"Chat {chat_id}: Could not get file_path for current voice message.")
+                    logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Could not get file_path for current voice message.")
             except Exception as e_voice:
-                logger.error(f"Chat {chat_id}: Error processing current voice message: {e_voice}", exc_info=True)
+                logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): Error processing current voice message: {e_voice}", exc_info=True)
         
-        if replied_msg and not is_free_will_triggered and (is_mention_to_bot or is_direct_reply_to_bot):
+        # If replying to a message (and interacting with bot OR in activated chat), add media from replied message if current message lacks it
+        if replied_msg and not is_free_will_triggered and (is_mention_to_bot or is_direct_reply_to_bot or is_activated_chat_topic):
+            # Add replied image if current message has no image
             if replied_msg.photo and not has_image_from_current_message:
                 try:
                     photo_file_replied = await replied_msg.photo[-1].get_file()
                     file_bytes_replied = await photo_file_replied.download_as_bytearray()
                     base64_image_replied = base64.b64encode(file_bytes_replied).decode('utf-8')
                     mime_type_replied = mimetypes.guess_type(photo_file_replied.file_path or "img.jpg")[0] or 'image/jpeg'
+                    # Avoid adding duplicate media types
                     if not any(p.get("type") == "image_url" for p in user_content_parts_for_llm):
                         user_content_parts_for_llm.append({"type": "image_url", "image_url": {"url": f"data:{mime_type_replied};base64,{base64_image_replied}"}})
-                        logger.info(f"Chat {chat_id}: Added image_url from replied message to LLM content.")
+                        logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Added image_url from replied message to LLM content.")
+                        # Add placeholder text if no text content exists yet
+                        # This is from your original code:
                         if not any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm):
-                            placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + "(Note: Image sent in the replied message)"
-                            user_content_parts_for_llm.insert(0, {"type": "text", "text": placeholder_text.strip()})
+                            # Construct placeholder considering existing prefixes to avoid duplicating them if they were empty.
+                            current_placeholder_text = ""
+                            if speaker_context_prefix.strip() and speaker_context_prefix not in (user_content_parts_for_llm[0].get("text", "") if user_content_parts_for_llm and user_content_parts_for_llm[0].get("type")=="text" else ""):
+                                current_placeholder_text += speaker_context_prefix
+                            if reply_context_prefix.strip() and reply_context_prefix not in (user_content_parts_for_llm[0].get("text", "") if user_content_parts_for_llm and user_content_parts_for_llm[0].get("type")=="text" else ""):
+                                current_placeholder_text += reply_context_prefix
+                            current_placeholder_text += "(Note: Image sent in the replied message)"
+                            user_content_parts_for_llm.insert(0, {"type": "text", "text": current_placeholder_text.strip()})
                 except Exception as e_img_replied:
-                    logger.error(f"Chat {chat_id}: Error processing replied image: {e_img_replied}", exc_info=True)
+                    logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): Error processing replied image: {e_img_replied}", exc_info=True)
 
+            # Add replied voice if current message has no voice
             if replied_msg.voice and not has_voice_from_current_message:
                 try:
                     voice_replied: Voice = replied_msg.voice
                     voice_file_replied = await voice_replied.get_file()
                     if voice_file_replied.file_path:
+                        # Avoid adding duplicate media types
                         if not any(p.get("type") == "audio_url" for p in user_content_parts_for_llm):
                             user_content_parts_for_llm.append({
                                 "type": "audio_url",
                                 "audio_url": {"url": voice_file_replied.file_path}
                             })
-                            logger.info(f"Chat {chat_id}: Added audio_url from replied message to LLM content: {voice_file_replied.file_path}")
+                            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Added audio_url from replied message to LLM content: {voice_file_replied.file_path}")
+                            # Add placeholder text if no text content exists yet
+                            # This is from your original code:
                             if not any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm):
-                                placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + "(Note: Audio sent in the replied message)"
-                                user_content_parts_for_llm.insert(0, {"type": "text", "text": placeholder_text.strip()})
+                                current_placeholder_text = ""
+                                if speaker_context_prefix.strip() and speaker_context_prefix not in (user_content_parts_for_llm[0].get("text", "") if user_content_parts_for_llm and user_content_parts_for_llm[0].get("type")=="text" else ""):
+                                    current_placeholder_text += speaker_context_prefix
+                                if reply_context_prefix.strip() and reply_context_prefix not in (user_content_parts_for_llm[0].get("text", "") if user_content_parts_for_llm and user_content_parts_for_llm[0].get("type")=="text" else ""):
+                                    current_placeholder_text += reply_context_prefix
+                                current_placeholder_text += "(Note: Audio sent in the replied message)"
+                                user_content_parts_for_llm.insert(0, {"type": "text", "text": current_placeholder_text.strip()})
                     else:
-                        logger.warning(f"Chat {chat_id}: Could not get file_path for replied voice message.")
+                        logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Could not get file_path for replied voice message.")
                 except Exception as e_voice_replied:
-                    logger.error(f"Chat {chat_id}: Error processing replied voice message: {e_voice_replied}", exc_info=True)
+                    logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): Error processing replied voice message: {e_voice_replied}", exc_info=True)
             
+        # Final check: If message contains media but no text part was generated, add a placeholder text part.
+        # This is your original logic block, retained as requested.
         final_has_any_media = any(p.get("type") in ["image_url", "audio_url"] for p in user_content_parts_for_llm)
         final_has_any_text = any(p.get("type") == "text" and p.get("text","").strip() for p in user_content_parts_for_llm)
 
         if final_has_any_media and not final_has_any_text:
             placeholder_base_text = "(Note: Media present in message)" 
+            # Check if primarily audio or image to tailor the note slightly
             is_primarily_audio = any(p.get("type") == "audio_url" for p in user_content_parts_for_llm) and \
                                  not any(p.get("type") == "image_url" for p in user_content_parts_for_llm)
             is_primarily_image = any(p.get("type") == "image_url" for p in user_content_parts_for_llm) and \
@@ -1286,82 +1848,127 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             if is_primarily_audio: placeholder_base_text = "(Note: An audio file is sent in this message)"
             elif is_primarily_image: placeholder_base_text = "(Note: An image is sent in this message)"
             
+            # Combine with speaker/reply context if present
             final_placeholder_text = (speaker_context_prefix or "") + (reply_context_prefix or "") + placeholder_base_text
-            user_content_parts_for_llm.insert(0, {"type": "text", "text": final_placeholder_text.strip()})
+            # Ensure we don't insert an empty text part if prefixes were also empty.
+            if final_placeholder_text.strip():
+                user_content_parts_for_llm.insert(0, {"type": "text", "text": final_placeholder_text.strip()})
+                logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Inserted placeholder for media-only: '{final_placeholder_text.strip()[:100]}'")
 
 
+    # --- Final preparation before sending to LLM ---
+    # Ensure there's actually content to send
     if not user_content_parts_for_llm:
-        logger.warning(f"Chat {chat_id}: No content parts generated for LLM. Trigger: reply_bot={is_direct_reply_to_bot}, mention={is_mention_to_bot}, freewill={is_free_will_triggered}")
+        logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): No content parts generated for LLM. Trigger: reply_bot={is_direct_reply_to_bot}, mention={is_mention_to_bot}, freewill={is_free_will_triggered}, activated={is_activated_chat_topic}")
+        # Only reply with error if it wasn't a silent free will attempt
         if should_process_message and (not is_free_will_triggered):
-             await update.message.reply_text("I'm not sure how to respond to that.")
+            # update.message.reply_text handles thread ID
+            await update.message.reply_text("I'm not sure how to respond to that.") 
         return
 
+    # Determine final content format (string or list of parts)
     final_llm_content: Union[str, List[Dict[str, Any]]]
     if len(user_content_parts_for_llm) == 1 and user_content_parts_for_llm[0].get("type") == "text":
+        # If only one text part, send as a simple string
         final_llm_content = user_content_parts_for_llm[0]["text"]
-        if not final_llm_content.strip():
-            logger.warning(f"Chat {chat_id}: Final LLM content string is empty. Not sending.")
+        if not final_llm_content.strip(): # Check if the string content itself is empty
+            logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Final LLM content string is empty after processing. Not sending.")
             if should_process_message and (not is_free_will_triggered):
-                await update.message.reply_text("I didn't get any text to process.")
+                await update.message.reply_text("I didn't get any text to process.") 
             return
     else:
-        final_llm_content = [p for p in user_content_parts_for_llm if not (p.get("type") == "text" and not p.get("text","").strip())]
-        if not final_llm_content:
-            logger.warning(f"Chat {chat_id}: Final LLM multi-part content is empty after filtering. Not sending.")
+        # Otherwise, send as a list of parts, filtering out any empty text parts that might have snuck in
+        # or parts that are not dictionaries (though this should not happen with current logic)
+        final_llm_content = [
+            p for p in user_content_parts_for_llm 
+            if isinstance(p, dict) and not (p.get("type") == "text" and not p.get("text","").strip())
+        ]
+        if not final_llm_content: # If list is empty after filtering
+            logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Final LLM multi-part content is empty after filtering. Not sending.")
             if should_process_message and (not is_free_will_triggered):
-                 await update.message.reply_text("I didn't get any content to process.")
+                 await update.message.reply_text("I didn't get any content to process.") 
             return
         
         # If only media remains after filtering, re-add a placeholder text if one wasn't added before
         # This check is more nuanced now with multiple media types.
         # The previous logic to add placeholder if (has_image or has_voice) and no text should cover this.
         # However, a final check if only media part(s) exist and no text part:
-        if all(p.get("type") in ["image_url", "audio_url"] for p in final_llm_content) and \
-           not any(p.get("type") == "text" for p in final_llm_content):
+        if all(p.get("type") in ["image_url", "audio_url"] for p in final_llm_content if isinstance(p, dict)) and \
+           not any(p.get("type") == "text" for p in final_llm_content if isinstance(p, dict)):
             placeholder_text_for_lone_media = "Regarding the attached media:"
-            if any(p.get("type") == "audio_url" for p in final_llm_content) and \
-               not any(p.get("type") == "image_url" for p in final_llm_content):
-                placeholder_text_for_lone_media = "Please transcribe and respond to the attached audio message:"
-            final_placeholder_text_lone = (speaker_context_prefix or "") + (reply_context_prefix or "") + placeholder_text_for_lone_media
-            final_llm_content.insert(0, {"type": "text", "text": final_placeholder_text_lone.strip()})
+            # Tailor placeholder if only audio
+            if any(p.get("type") == "audio_url" for p in final_llm_content if isinstance(p,dict)) and \
+               not any(p.get("type") == "image_url" for p in final_llm_content if isinstance(p,dict)):
+                placeholder_text_for_lone_media = "Regarding the attached audio message:"
+            
+            # Combine with context prefixes if they existed but didn't form part of a text message
+            final_placeholder_text_lone = ""
+            if speaker_context_prefix: final_placeholder_text_lone += speaker_context_prefix
+            if reply_context_prefix: final_placeholder_text_lone += reply_context_prefix 
+            final_placeholder_text_lone += placeholder_text_for_lone_media
+            
+            if final_placeholder_text_lone.strip(): # Ensure we insert non-empty text
+                final_llm_content.insert(0, {"type": "text", "text": final_placeholder_text_lone.strip()})
+                logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Inserted placeholder for lone media after filtering: '{final_placeholder_text_lone.strip()[:100]}'")
 
-    llm_history.append({"role": "user", "content": final_llm_content})
+
+    # Append the final user message (string or list) to the history
+    llm_history.append({"role": "user", "content": final_llm_content}) # final_llm_content is now guaranteed to be non-empty if we reach here
     
+    # Log the content being sent (with truncation)
     log_content_summary = ""
     if isinstance(final_llm_content, str):
         log_content_summary = f"Content (string): '{final_llm_content[:150].replace(chr(10), '/N')}...'"
     elif isinstance(final_llm_content, list):
-        # Improved logging for multi-part including audio
         part_summaries = []
         for p_idx, p_content in enumerate(final_llm_content):
-            p_type = p_content.get("type", "unknown")
+            p_type = p_content.get("type", "unknown") if isinstance(p_content, dict) else "unknown_item_type"
             p_summary_text = ""
-            if p_type == "text":
-                p_summary_text = p_content.get("text", "")[:70]
-            elif p_type == "image_url":
-                p_summary_text = "[Base64 Image Data]" # Or log part of URL if not base64
-            elif p_type == "audio_url":
-                p_summary_text = p_content.get("audio_url", {}).get("url", "")[:70] # Log part of URL
-            else:
-                p_summary_text = str(p_content)[:70]
+            if isinstance(p_content, dict):
+                if p_type == "text":
+                    p_summary_text = p_content.get("text", "")[:200]
+                elif p_type == "image_url":
+                    p_summary_text = "[Base64 Image Data]" 
+                elif p_type == "audio_url":
+                    p_summary_text = p_content.get("audio_url", {}).get("url", "")[:200] 
+                else:
+                    p_summary_text = str(p_content)[:200]
+            else: # Should not happen if filtering was correct
+                p_summary_text = str(p_content)[:200]
+
             part_summaries.append(f"{p_type.capitalize()}[{p_idx}]: {p_summary_text.replace(chr(10), '/N')}...")
         log_content_summary = f"Content (multi-part): {part_summaries}"
-    logger.info(f"Chat {chat_id}: Appended user message to LLM history. {log_content_summary}. Processed due to: reply_to_bot={is_direct_reply_to_bot}, mention={is_mention_to_bot}, free_will={is_free_will_triggered}, DM={chat_type==Chat.PRIVATE}")
+    logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Appended user message to LLM history. {log_content_summary}. Processed due to: reply_to_bot={is_direct_reply_to_bot}, mention={is_mention_to_bot}, free_will={is_free_will_triggered}, DM={chat_type==Chat.PRIVATE}, activated={is_activated_chat_topic}")
 
+    # --- Call the LLM API and Handle Response ---
     typing_task: Optional[asyncio.Task] = None
-    initial_action = ChatAction.TYPING
-    # Check for image_url or audio_url type for initial action NOT NEEDED BECAUSE THE AI REPLIES WITH TEXT!
-    #
-    #if isinstance(final_llm_content, list):
-    #    if any(isinstance(part, dict) and part.get("type") == "image_url" for part in final_llm_content):
-    #        initial_action = ChatAction.UPLOAD_PHOTO
-    #        logger.debug(f"Chat {chat_id}: Setting initial chat action to UPLOAD_PHOTO due to image content.")
-    #    elif any(isinstance(part, dict) and part.get("type") == "audio_url" for part in final_llm_content):
-    #        initial_action = ChatAction.UPLOAD_VOICE # Using UPLOAD_VOICE
-    #        logger.debug(f"Chat {chat_id}: Setting initial chat action to UPLOAD_VOICE due to audio content.")
+    initial_action = ChatAction.TYPING # Default action
+    
+    # Send initial chat action respecting thread ID, with fallback and timeout handling
+    effective_thread_id_for_action = current_message_thread_id
+    try:
+        await context.bot.send_chat_action(chat_id, initial_action, message_thread_id=effective_thread_id_for_action)
+    except telegram.error.BadRequest as e_action:
+        if "message thread not found" in e_action.message.lower() and effective_thread_id_for_action is not None:
+            logger.warning(f"Chat {chat_id}: Thread {effective_thread_id_for_action} not found for initial chat action. Attempting general chat.")
+            effective_thread_id_for_action = None # Fallback to general for typing loop
+            try:
+                await context.bot.send_chat_action(chat_id, initial_action, message_thread_id=None)
+            except Exception as e_action_general:
+                logger.error(f"Chat {chat_id}: Failed to send initial chat action to general after thread failure: {e_action_general}")
+                # typing_task will remain None
+        else:
+            logger.error(f"Chat {chat_id} (thread {effective_thread_id_for_action}): Failed to send initial chat action: {e_action}")
+            # typing_task will remain None
+    except (telegram.error.TimedOut, httpx.TimeoutException) as e_timeout_action:
+        logger.error(f"Chat {chat_id} (thread {effective_thread_id_for_action}): Timeout sending initial chat action: {e_timeout_action}")
+        # typing_task will remain None
+    except Exception as e_generic_action:
+        logger.error(f"Chat {chat_id} (thread {effective_thread_id_for_action}): Generic error sending initial chat action: {e_generic_action}")
+        # typing_task will remain None
+    else: # If initial send_chat_action was successful
+        typing_task = asyncio.create_task(_keep_typing_loop(context, chat_id, effective_thread_id_for_action, action=initial_action))
 
-    await context.bot.send_chat_action(chat_id, initial_action)
-    typing_task = asyncio.create_task(_keep_typing_loop(context, chat_id, action=initial_action))
 
     MAX_TOOL_ITERATIONS, current_iteration = 5, 0
     tool_status_msg: Optional[TelegramMessage] = None
@@ -1372,75 +1979,91 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         ai_msg_obj: Optional[ChatCompletionMessage] = None
         while current_iteration < MAX_TOOL_ITERATIONS:
             current_iteration += 1
-            messages_for_this_api_call = list(llm_history)
+            messages_for_this_api_call = list(llm_history) # Use a copy for the API call
+            # Prepare API parameters
             api_params: Dict[str, Any] = {
                 "model": f"shapesinc/{SHAPESINC_SHAPE_USERNAME}",
                 "messages": messages_for_this_api_call
             }
+            # Add tools if enabled and not a free-will trigger
             if ENABLE_TOOL_USE and TOOL_DEFINITIONS_FOR_API and not is_free_will_triggered:
+                # Decide tool_choice: 'none' if last message was tool result, else 'auto'
                 last_message_in_llm_history = llm_history[-1] if llm_history else None
                 if last_message_in_llm_history and last_message_in_llm_history.get("role") == "tool":
                     api_params.update({"tools": TOOL_DEFINITIONS_FOR_API, "tool_choice": "none"})
                 else:
                     api_params.update({"tools": TOOL_DEFINITIONS_FOR_API, "tool_choice": "auto"})
-            elif is_free_will_triggered:
+            elif is_free_will_triggered: # Explicitly disable tools for free will
                 api_params.pop("tools", None)
                 api_params.pop("tool_choice", None)
             
-            # Logging for API call content (more robust for different types)
+            # Log API call details (more robust logging)
             try: 
                 logged_msgs_sample_parts = []
                 num_messages_to_log_sample = min(3, len(api_params["messages"]))
                 for msg_param_idx, msg_param_any_type in enumerate(api_params["messages"][-num_messages_to_log_sample:]): 
+                    # Handle potential non-dict items (though unlikely with current structure)
                     if not isinstance(msg_param_any_type, dict):
                         logged_msgs_sample_parts.append(f"Msg {len(api_params['messages']) - num_messages_to_log_sample + msg_param_idx}: Non-dict item - {str(msg_param_any_type)[:100]}") 
                         continue
-                    msg_dict_for_log = dict(msg_param_any_type) 
+                    msg_dict_for_log = dict(msg_param_any_type) # Work with a copy
+                    # Summarize content
                     if "content" in msg_dict_for_log:
                         content_val = msg_dict_for_log["content"]
                         if isinstance(content_val, str):
-                            msg_dict_for_log["content"] = content_val[:100] + ('...' if len(content_val) > 100 else '')
-                        elif isinstance(content_val, list): 
+                            msg_dict_for_log["content"] = content_val[:500] + ('...' if len(content_val) > 500 else '')
+                        elif isinstance(content_val, list): # Summarize multi-part content
                             summarized_parts = []
                             for part_content_idx, part_content in enumerate(content_val):
-                                part_type_str = part_content.get("type", "unknown_part_type")
-                                summary_text_val = ""
-                                if part_type_str == "text":
-                                    summary_text_val = part_content.get('text','')[:70].replace(chr(10),'/N')
-                                elif part_type_str == "image_url":
-                                    summary_text_val = "[Base64 Image]" # Or part_content.get('image_url',{}).get('url','')[:70]
-                                elif part_type_str == "audio_url":
-                                    summary_text_val = part_content.get('audio_url',{}).get('url','')[:70].replace(chr(10),'/N')
-                                else: 
-                                    summary_text_val = str(part_content)[:70].replace(chr(10),'/N')
-                                summarized_parts.append(f"{part_type_str.capitalize()}[{part_content_idx}]: {summary_text_val}...")
+                                if isinstance(part_content, dict):
+                                    part_type_str = part_content.get("type", "unknown_part_type")
+                                    summary_text_val = ""
+                                    if part_type_str == "text":
+                                        summary_text_val = part_content.get('text','')[:200].replace(chr(10),'/N')
+                                    elif part_type_str == "image_url":
+                                        summary_text_val = "[Base64 Image]" 
+                                    elif part_type_str == "audio_url":
+                                        summary_text_val = part_content.get('audio_url',{}).get('url','')[:200].replace(chr(10),'/N')
+                                    else: 
+                                        summary_text_val = str(part_content)[:200].replace(chr(10),'/N')
+                                    summarized_parts.append(f"{part_type_str.capitalize()}[{part_content_idx}]: {summary_text_val}...")
+                                else: # if part_content is not a dict
+                                    summarized_parts.append(f"Part[{part_content_idx}]: {str(part_content)[:200]}...")
                             msg_dict_for_log["content"] = summarized_parts
+                    # Summarize tool calls
                     if "tool_calls" in msg_dict_for_log and isinstance(msg_dict_for_log.get("tool_calls"), list):
                         tool_calls_list = msg_dict_for_log["tool_calls"]
                         num_tc = len(tool_calls_list)
                         tc_names_sample = [
-                            tc.get('function', {}).get('name', '?') 
-                            for tc in tool_calls_list[:2] if isinstance(tc, dict)
+                            (tc.get('function', {}).get('name', '?') if isinstance(tc, dict) else '?')
+                            for tc in tool_calls_list[:2]
                         ]
                         msg_dict_for_log["tool_calls"] = f"<{num_tc} tool_calls: {tc_names_sample}...>"
                     logged_msgs_sample_parts.append(f"Msg {len(api_params['messages']) - num_messages_to_log_sample + msg_param_idx}: {msg_dict_for_log}") 
                 messages_log_str = "\n".join(logged_msgs_sample_parts)
-            except Exception as log_e_inner: 
+            except Exception as log_e_inner: # Fallback logging if summary fails
                 raw_sample_str = [str(m)[:150] for m in api_params["messages"][-2:]] 
                 messages_log_str = f"Error in detailed message logging: {log_e_inner}. Raw sample: {raw_sample_str}"
 
+
+            # Add custom headers for API call
             custom_headers_for_api = {
                 "X-User-Id": str(current_user.id),
-                "X-Channel-Id": str(chat_id)
+                "X-Channel-Id": str(chat_id) 
             }
+            # Include thread ID in headers if present
+            if current_message_thread_id is not None: 
+                 custom_headers_for_api["X-Thread-Id"] = str(current_message_thread_id)
+
 
             logger.info(
-                f"API Call (iter {current_iteration}/{MAX_TOOL_ITERATIONS}, FreeWill={is_free_will_triggered}) to {api_params['model']} for chat {chat_id}. "
+                f"API Call (iter {current_iteration}/{MAX_TOOL_ITERATIONS}, FreeWill={is_free_will_triggered}) to {api_params['model']} for chat {chat_id} (thread {current_message_thread_id}). "
                 f"Tool choice: {api_params.get('tool_choice', 'N/A')}. LLM History len: {len(llm_history)}. "
                 f"Custom Headers: {custom_headers_for_api}. \n"
                 f"API Messages (sample):\n{messages_log_str}"
             )
 
+            # Execute the API call
             response_from_ai = await aclient_shape.chat.completions.create(
                 model=api_params["model"],
                 messages=api_params["messages"], 
@@ -1449,316 +2072,513 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                 extra_headers=custom_headers_for_api
             )
             ai_msg_obj = response_from_ai.choices[0].message
-            llm_history.append(ai_msg_obj.model_dump(exclude_none=True))
-            logger.debug(f"Chat {chat_id}: Appended assistant's response to LLM history. Last item: {str(llm_history[-1])[:250].replace(chr(10), '/N')}...")
+            # Append AI's response (potentially including tool calls) to history
+            llm_history.append(ai_msg_obj.model_dump(exclude_none=True)) 
+            logger.debug(f"Chat {chat_id} (thread {current_message_thread_id}): Appended assistant's response to LLM history. Last item: {str(llm_history[-1])[:250].replace(chr(10), '/N')}...")
 
+            # --- Handle Tool Calls ---
             if ai_msg_obj.tool_calls:
+                # Check if tools are actually enabled globally
                 if not ENABLE_TOOL_USE: 
-                    logger.warning(f"Chat {chat_id}: AI attempted tool use, but ENABLE_TOOL_USE is false. Tool calls: {ai_msg_obj.tool_calls}")
+                    logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI attempted tool use, but ENABLE_TOOL_USE is false. Tool calls: {ai_msg_obj.tool_calls}")
                     final_text_to_send_to_user = "I tried to use a special tool, but it's currently disabled. Please ask in a different way."
-                    llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} 
-                    break
+                    llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} # Overwrite tool call message
+                    break # Exit tool loop
+                # Check if tools should be disabled for this specific call (free will)
                 if is_free_will_triggered:
-                    logger.warning(f"Chat {chat_id}: AI attempted tool use during free will, but tools are disabled for free will. Ignoring tool call.")
+                    logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI attempted tool use during free will, but tools are disabled for free will. Ignoring tool call.")
                     final_text_to_send_to_user = ai_msg_obj.content or "I had a thought but it involved a tool I can't use for spontaneous comments. Never mind!"
-                    llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user}
-                    break
+                    llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} # Overwrite tool call
+                    break # Exit tool loop
 
+                # Send a "using tools" status message if not already sent
                 if not tool_status_msg and chat_id:
                     tool_names_str = ", ".join(sorted(list(set(tc.function.name for tc in ai_msg_obj.tool_calls if tc.function and tc.function.name))))
                     status_text = f"🛠️ Activating tools: {tool_names_str}..."
-                    try: tool_status_msg = await context.bot.send_message(chat_id, text=status_text)
-                    except Exception as e_send_status: logger.warning(f"Chat {chat_id}: Failed to send tool status message: {e_send_status}")
+                    try: 
+                        # Use helper to send status message, respecting thread
+                        tool_status_msg = await send_message_to_chat_or_general(
+                            context.bot, chat_id, status_text, preferred_thread_id=current_message_thread_id
+                        )
+                    except Exception as e_send_status: 
+                        logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Failed to send tool status message: {e_send_status}")
 
+                # Execute each tool call
                 tool_results_for_history: list[ChatCompletionMessageParam] = []
                 for tool_call in ai_msg_obj.tool_calls:
                     func_name, tool_call_id, args_str = tool_call.function.name, tool_call.id, tool_call.function.arguments
-                    logger.info(f"Chat {chat_id}: AI requests tool: '{func_name}' (ID: {tool_call_id}) with raw args: {args_str}")
-                    tool_content_result = f"Error: Tool '{func_name}' execution failed or tool is unknown."
+                    logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): AI requests tool: '{func_name}' (ID: {tool_call_id}) with raw args: {args_str}")
+                    tool_content_result = f"Error: Tool '{func_name}' execution failed or tool is unknown." # Default error
+                    # Check if the requested tool function exists
                     if func_name in AVAILABLE_TOOLS_PYTHON_FUNCTIONS:
                         try:
                             py_func = AVAILABLE_TOOLS_PYTHON_FUNCTIONS[func_name]
+                            # Parse arguments safely
                             parsed_args: Dict[str, Any] = {}
                             if args_str and args_str.strip(): 
                                 parsed_args = json.loads(args_str)
                             else: 
-                                logger.warning(f"Chat {chat_id}: Tool '{func_name}' called with empty/null arguments string. Raw: '{args_str}'. Proceeding with empty dict if function allows.")
+                                logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Tool '{func_name}' called with empty/null arguments string. Raw: '{args_str}'. Proceeding with empty dict if function allows.")
+                            # Ensure parsed args are a dictionary
                             if not isinstance(parsed_args, dict): 
                                 raise TypeError(f"Parsed arguments for tool '{func_name}' are not a dictionary. Got {type(parsed_args)} from '{args_str}'")
                             
+                            # Inject necessary context for specific tools
                             kwargs_for_tool = parsed_args.copy()
                             if func_name == "create_poll_in_chat": 
                                 kwargs_for_tool["telegram_bot_context"] = context
                                 kwargs_for_tool["current_chat_id"] = chat_id
+                                kwargs_for_tool["current_message_thread_id"] = current_message_thread_id 
                             # Add similar blocks if other tools need context in the future
                             
+                            # Execute the tool function (async or sync)
                             output = await py_func(**kwargs_for_tool) if asyncio.iscoroutinefunction(py_func) else await asyncio.to_thread(py_func, **kwargs_for_tool)
                             tool_content_result = str(output)
-                            logger.info(f"Chat {chat_id}: Tool '{func_name}' executed. Output snippet: {tool_content_result[:200].replace(chr(10), ' ')}")
+                            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Tool '{func_name}' executed. Output snippet: {tool_content_result[:200].replace(chr(10), ' ')}")
                         except (json.JSONDecodeError, TypeError, ValueError) as e_parse_args:
+                            # Handle errors during argument parsing or calling with wrong types
                             err_msg = f"Error parsing arguments or calling tool '{func_name}': {e_parse_args}. Raw args: '{args_str}'"
-                            logger.error(f"Chat {chat_id}: {err_msg}", exc_info=True); tool_content_result = err_msg
+                            logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): {err_msg}", exc_info=True); tool_content_result = err_msg
                         except Exception as e_tool_exec: 
+                            # Handle unexpected errors during tool execution
                             err_msg = f"Unexpected error executing tool '{func_name}': {e_tool_exec}"
-                            logger.error(f"Chat {chat_id}: {err_msg}", exc_info=True); tool_content_result = err_msg
+                            logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): {err_msg}", exc_info=True); tool_content_result = err_msg
                     else: 
-                        logger.warning(f"Chat {chat_id}: AI requested unknown tool: '{func_name}'")
+                        # Handle case where AI hallucinated a tool name
+                        logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI requested unknown tool: '{func_name}'")
                         tool_content_result = f"Error: Tool '{func_name}' is not available."
                     
+                    # Prepare the tool result message for the LLM history
                     tool_results_for_history.append({"tool_call_id": tool_call_id, "role": "tool", "name": func_name, "content": tool_content_result}) 
                 
+                # Add all tool results to the history for the next API call
                 llm_history.extend(tool_results_for_history)
-                logger.debug(f"Chat {chat_id}: Extended LLM history with {len(tool_results_for_history)} tool results.")
+                logger.debug(f"Chat {chat_id} (thread {current_message_thread_id}): Extended LLM history with {len(tool_results_for_history)} tool results.")
+                # Loop continues for the next API call with tool results provided
 
+            # --- Handle Final Text Response ---
             elif ai_msg_obj.content is not None: 
+                # If the AI provided text content directly, this is the final answer
                 final_text_to_send_to_user = str(ai_msg_obj.content)
-                logger.info(f"Chat {chat_id}: AI final text response (iter {current_iteration}): '{final_text_to_send_to_user[:120].replace(chr(10), ' ')}...'")
-                break 
+                logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): AI final text response (iter {current_iteration}): '{final_text_to_send_to_user[:120].replace(chr(10), ' ')}...'")
+                break # Exit the tool loop, we have the final response
+            
+            # --- Handle Empty/Unusual Response ---
             else: 
-                logger.warning(f"Chat {chat_id}: AI response (iter {current_iteration}) had no tool_calls and content was None. Response: {ai_msg_obj.model_dump_json(indent=2)}")
+                # If the AI response has neither tool calls nor content
+                logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI response (iter {current_iteration}) had no tool_calls and content was None. Response: {ai_msg_obj.model_dump_json(indent=2)}")
                 final_text_to_send_to_user = "AI provided an empty or unusual response. Please try rephrasing."
-                llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} 
-                break
+                llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} # Overwrite empty response
+                break # Exit loop with error message
         
+        # --- Handle Max Iterations Reached ---
+        # If loop finished without a final text response (e.g., max tool calls)
         if current_iteration >= MAX_TOOL_ITERATIONS and not (ai_msg_obj and ai_msg_obj.content is not None):
-            logger.warning(f"Chat {chat_id}: Max tool iterations ({MAX_TOOL_ITERATIONS}) reached without final content from AI.")
+            logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Max tool iterations ({MAX_TOOL_ITERATIONS}) reached without final content from AI.")
             final_text_to_send_to_user = "I tried using my tools multiple times but couldn't get a final answer. Could you try rephrasing your request or ask in a different way?"
+            # Append this error message to history if it's not already the last assistant message
             if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_to_send_to_user): 
                  llm_history.append({"role": "assistant", "content": final_text_to_send_to_user}) 
 
-        if tool_status_msg and chat_id:
+        # --- Clean up Status Messages ---
+        # Delete the "using tools" status message if it was sent
+        if tool_status_msg and chat_id: # tool_status_msg is a TelegramMessage object
             try: await tool_status_msg.delete()
-            except Exception as e_del: logger.warning(f"Chat {chat_id}: Could not delete tool status msg ID {tool_status_msg.message_id}: {e_del}")
+            except Exception as e_del: logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Could not delete tool status msg ID {tool_status_msg.message_id}: {e_del}")
 
+        # --- Prepare Final Text for Sending ---
+        # Ensure final text is not empty or just whitespace
         if not final_text_to_send_to_user.strip():
-            logger.warning(f"Chat {chat_id}: Final AI text to send was empty or whitespace. Defaulting to error message.")
+            logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Final AI text to send was empty or whitespace. Defaulting to error message.")
             final_text_to_send_to_user = "I'm sorry, I couldn't generate a valid response for that. Please try again."
+            # Update history if last message was empty assistant content
             if llm_history and llm_history[-1].get("role") == "assistant" and not llm_history[-1].get("content","").strip(): 
                 llm_history[-1]["content"] = final_text_to_send_to_user
 
-        logger.info(f"Chat {chat_id}: RAW AI response for user: >>>{final_text_to_send_to_user[:200].replace(chr(10), '/N')}...<<<")
+        # Escape the final text for Telegram MarkdownV2
+        logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): RAW AI response for user: >>>{final_text_to_send_to_user[:200].replace(chr(10), '/N')}...<<<")
         escaped_text_for_splitting = telegram_markdown_v2_escape(final_text_to_send_to_user)
-        logger.info(f"Chat {chat_id}: FULLY ESCAPED text for user: >>>{escaped_text_for_splitting[:200].replace(chr(10), '/N')}...<<<")
+        logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): FULLY ESCAPED text for user: >>>{escaped_text_for_splitting[:200].replace(chr(10), '/N')}...<<<")
 
+        # --- Stop Typing Indicator and Send Response ---
         if typing_task and not typing_task.done(): typing_task.cancel(); typing_task = None
-        max_mdv2_len, safe_truncate_len = 4096, 4096 - 150 
+        max_mdv2_len = 4096 # Telegram's max message length
+        send_thread_id = current_message_thread_id # Use the determined thread ID for sending
 
-        if len(escaped_text_for_splitting) <= max_mdv2_len:
+        # Wrapper for sending a single message chunk with fallback logic
+        async def attempt_send_one_message_wrapper(
+            bot_obj: Bot,
+            chat_id_val: int,
+            text_content: str,
+            preferred_thread_id_val: Optional[int],
+            try_markdown: bool
+        ):
+            parse_mode_to_try = ParseMode.MARKDOWN_V2 if try_markdown else None
             try:
-                await context.bot.send_message(chat_id, text=escaped_text_for_splitting, parse_mode=ParseMode.MARKDOWN_V2)
-            except telegram.error.BadRequest as e_single_send: 
-                logger.error(f"Chat {chat_id}: MDv2 send failed (len {len(escaped_text_for_splitting)}): {e_single_send}. Esc: '{escaped_text_for_splitting[:100].replace(chr(10), '/N')}...' Attempting plain text.")
+                # Use the helper function which handles thread-not-found fallback
+                await send_message_to_chat_or_general(
+                    bot_obj, chat_id_val, text_content,
+                    preferred_thread_id=preferred_thread_id_val,
+                    parse_mode=parse_mode_to_try
+                )
+                return True # Success
+            except telegram.error.BadRequest as e_send:
+                # This error occurs *after* the helper tried both preferred thread and general chat.
+                # It likely indicates a content issue (bad Markdown) or other permission problem.
+                logger.error(
+                    f"Chat {chat_id_val} (attempted thread {preferred_thread_id_val}, then general): "
+                    f"Send failed with {'MDv2' if try_markdown else 'Plain'}. Error: {e_send}. "
+                    f"Text snippet: '{text_content[:100]}'"
+                )
+                if try_markdown:
+                    return False # Indicate MD failure, outer logic should try plain
+                else: # Plain text also failed (after MD fallback, or was initial plain try)
+                    raise e_send # Re-raise, as even plain text send failed
+            except Exception as e_other_send_error:
+                 logger.error(f"Chat {chat_id_val}: Unexpected error during attempt_send_one_message_wrapper: {e_other_send_error}", exc_info=True)
+                 raise e_other_send_error
+
+        # --- Sending Logic: Single Message or Split ---
+        if len(escaped_text_for_splitting) <= max_mdv2_len:
+            # Try sending the single message with MarkdownV2
+            if not await attempt_send_one_message_wrapper(
+                context.bot, chat_id, escaped_text_for_splitting,
+                send_thread_id, try_markdown=True
+            ):
+                # MDv2 failed, try sending the original, unescaped plain text version
+                logger.info(f"Chat {chat_id} (thread {send_thread_id}): MDv2 failed for single message, falling back to plain text: {final_text_to_send_to_user[:100]}")
                 try:
-                    plain_fb_full = final_text_to_send_to_user 
-                    if len(plain_fb_full) <= max_mdv2_len:
-                        await context.bot.send_message(chat_id, text=plain_fb_full)
-                    else: 
-                        logger.warning(f"Chat {chat_id}: Plain text fallback also too long ({len(plain_fb_full)}), splitting.")
-                        num_chunks_plain = (len(plain_fb_full) + max_mdv2_len -1) // max_mdv2_len
-                        for i, chunk in enumerate([plain_fb_full[j:j+max_mdv2_len] for j in range(0, len(plain_fb_full), max_mdv2_len)]):
-                            hdr = f"[Fallback Part {i+1}/{ num_chunks_plain }]\n" if num_chunks_plain > 1 else ""
-                            await context.bot.send_message(chat_id, text=hdr + chunk)
-                            if i < num_chunks_plain -1: await asyncio.sleep(0.5)
-                    logger.info(f"Chat {chat_id}: Sent as plain text fallback after MDv2 error.")
-                except Exception as e_fb_send:
-                    logger.error(f"Chat {chat_id}: Plain text fallback send also failed: {e_fb_send}");
-                    await context.bot.send_message(chat_id, "Error formatting my response. (SNGF)")
-        else: 
-            logger.info(f"Chat {chat_id}: Escaped text too long ({len(escaped_text_for_splitting)}), using intelligent splitting.")
+                    await attempt_send_one_message_wrapper(
+                        context.bot, chat_id, final_text_to_send_to_user, # Use original plain text
+                        send_thread_id, try_markdown=False
+                    )
+                except Exception as e_final_plain_send:
+                    # If plain text also fails (rare), log and send a final error message
+                    logger.error(f"Chat {chat_id} (thread {send_thread_id}): Final plain text send also failed: {e_final_plain_send}")
+                    await send_message_to_chat_or_general(
+                        context.bot, chat_id, "Error formatting and sending my response. (S_ULT_FAIL)",
+                        preferred_thread_id=send_thread_id
+                    )
+        else: # Text is too long, needs splitting
+            logger.info(f"Chat {chat_id} (thread {send_thread_id}): Escaped text too long ({len(escaped_text_for_splitting)}), using intelligent splitting.")
+            # Split the escaped text using the balancing splitter
             message_parts_to_send = split_message_with_markdown_balancing(escaped_text_for_splitting, max_mdv2_len, logger)
+            
+            # Handle case where splitter returns nothing for non-empty text (should be rare)
+            if not message_parts_to_send and escaped_text_for_splitting.strip():
+                logger.warning(f"Chat {chat_id} (thread {send_thread_id}): Splitter returned no parts for non-empty text. Sending truncated.")
+                safe_truncate_len = 4096 - 150 # Leave room for truncation marker
+                trunc_txt = escaped_text_for_splitting[:safe_truncate_len] + "\n\\[MESSAGE_TRUNCATED_SPLIT_FAIL\\]"
+                message_parts_to_send.append(trunc_txt[:max_mdv2_len])
 
-            if not message_parts_to_send and escaped_text_for_splitting.strip(): 
-                 logger.warning(f"Chat {chat_id}: Splitter returned no parts for non-empty text. Sending truncated. Text: {escaped_text_for_splitting[:100].replace(chr(10), '/N')}")
-                 trunc_txt = escaped_text_for_splitting[:safe_truncate_len] + "\n\\[MESSAGE_TRUNCATED_SPLIT_FAIL\\]"
-                 message_parts_to_send.append(trunc_txt[:max_mdv2_len]) 
-
-            for i, part_chunk in enumerate(message_parts_to_send):
-                current_chunk_to_send = part_chunk.strip()
-                if not current_chunk_to_send: 
-                    temp_strip_styles = part_chunk
+            # Send each part
+            for i, part_chunk_md_escaped in enumerate(message_parts_to_send):
+                current_chunk_to_send = part_chunk_md_escaped.strip()
+                # Skip parts that are effectively empty after stripping (e.g., only whitespace or markdown delimiters)
+                if not current_chunk_to_send:
+                    temp_strip_styles = part_chunk_md_escaped
                     for delim_s in _BALANCING_MARKDOWN_DELIMITERS: temp_strip_styles = temp_strip_styles.replace(delim_s, "")
                     if not temp_strip_styles.strip(): 
-                        logger.info(f"Chat {chat_id}: Skipping empty or style-only part {i+1} from splitter."); continue
-                    current_chunk_to_send = part_chunk 
-
+                        logger.info(f"Chat {chat_id} (thread {send_thread_id}): Skipping empty or style-only part {i+1} from splitter."); continue
+                
+                # Safety truncate if a split part is somehow still too long (should not happen with correct splitter)
                 if len(current_chunk_to_send) > max_mdv2_len: 
-                    logger.warning(f"Chat {chat_id}: Split part {i+1} still too long ({len(current_chunk_to_send)}). Truncating.")
+                    safe_truncate_len = 4096 - 150 # Leave room for marker
+                    logger.warning(f"Chat {chat_id} (thread {send_thread_id}): Split part {i+1} still too long ({len(current_chunk_to_send)}). Truncating.")
                     current_chunk_to_send = current_chunk_to_send[:safe_truncate_len] + "\n\\[MESSAGE_PART_TRUNCATED\\]"
-                    current_chunk_to_send = current_chunk_to_send[:max_mdv2_len] 
-
-                logger.info(f"Chat {chat_id}: Sending MDv2 part {i+1}/{len(message_parts_to_send)} (len: {len(current_chunk_to_send)}): '{current_chunk_to_send[:70].replace(chr(10),'/N')}...'")
-                try:
-                    await context.bot.send_message(chat_id, text=current_chunk_to_send, parse_mode=ParseMode.MARKDOWN_V2)
-                    if i < len(message_parts_to_send) - 1: await asyncio.sleep(0.75) 
-                except telegram.error.BadRequest as e_split_part_send:
-                    logger.error(f"Chat {chat_id}: MDv2 send failed for SPLIT part {i+1} (len {len(current_chunk_to_send)}): {e_split_part_send}. Chunk: '{current_chunk_to_send[:100].replace(chr(10),'/N')}...' Attempting plain text for this part.")
-                    fb_hdr = f"[Part {i+1}/{len(message_parts_to_send)} (escaped content, shown plain due to formatting error)]:\n"
-                    plain_chunk_fb = fb_hdr + current_chunk_to_send 
-
-                    if len(plain_chunk_fb) > max_mdv2_len:
-                        avail_len_for_content = max_mdv2_len - len(fb_hdr) - len("\n[...TRUNCATED_PLAIN_PART]")
-                        plain_chunk_fb = fb_hdr + current_chunk_to_send[:max(0, avail_len_for_content)] + "\n[...TRUNCATED_PLAIN_PART]"
+                    current_chunk_to_send = current_chunk_to_send[:max_mdv2_len] # Final enforcement
+                
+                logger.info(f"Chat {chat_id} (thread {send_thread_id}): Sending MDv2 part {i+1}/{len(message_parts_to_send)} (len: {len(current_chunk_to_send)}): '{current_chunk_to_send[:200].replace(chr(10),'/N')}...'")
+                # Try sending the MDv2 chunk
+                if not await attempt_send_one_message_wrapper(
+                    context.bot, chat_id, current_chunk_to_send,
+                    send_thread_id, try_markdown=True
+                ):
+                    # MDv2 chunk failed, try sending this *escaped* chunk as plain text
+                    # We send the escaped version because reversing the escape is complex and might lose intended formatting nuances.
+                    # Sending it as plain text preserves the content, even if the styling is lost.
+                    logger.info(f"Chat {chat_id} (thread {send_thread_id}): MDv2 failed for split part {i+1}, falling back to plain text for this part.")
                     try:
-                        await context.bot.send_message(chat_id, text=plain_chunk_fb[:max_mdv2_len])
-                    except Exception as e_fb_split_send:
-                        logger.error(f"Chat {chat_id}: Plain fallback for split part {i+1} also failed: {e_fb_split_send}")
-                        await context.bot.send_message(chat_id, f"[Problem sending part {i+1} of my response. (FPF2)]")
-                except Exception as e_gen_split_send: 
-                    logger.error(f"Chat {chat_id}: General error sending split part {i+1}: {e_gen_split_send}", exc_info=True)
-                    await context.bot.send_message(chat_id, f"[A problem occurred sending part {i+1} of my response. (SPF)]")
+                        await attempt_send_one_message_wrapper(
+                            context.bot, chat_id, current_chunk_to_send, # Send the escaped MD chunk as plain
+                            send_thread_id, try_markdown=False
+                        )
+                    except Exception as e_final_plain_chunk_send:
+                        logger.error(f"Chat {chat_id} (thread {send_thread_id}): Final plain text send for chunk {i+1} also failed: {e_final_plain_chunk_send}")
+                        # Send an error message for this specific chunk failure
+                        await send_message_to_chat_or_general(
+                            context.bot, chat_id, f"[Problem sending part {i+1} of my response. (C_ULT_FAIL)]",
+                            preferred_thread_id=send_thread_id
+                        )
+                # Small delay between sending parts
+                if i < len(message_parts_to_send) - 1:
+                    await asyncio.sleep(0.75) 
+        # --- END OF Sending Logic ---
 
-    except openai.InternalServerError as e_openai_ise: 
+    # --- Specific Exception Handling ---
+    # Use imported InternalServerError and APITimeoutError directly from openai
+    except InternalServerError as e_openai_ise: 
+        logger_chat_thread_info = f"Chat {chat_id} (thread {current_message_thread_id})"
+        # Handle specific 504 Gateway Timeout from the API
         if hasattr(e_openai_ise, 'response') and e_openai_ise.response and e_openai_ise.response.status_code == 504:
-            logger.error(f"Chat {chat_id}: Received 504 Gateway Timeout from Shapes API.", exc_info=True) 
+            logger.error(f"{logger_chat_thread_info}: Received 504 Gateway Timeout from Shapes API.", exc_info=True) 
             final_text_to_send_to_user = "The AI is taking a bit too long to generate a response and timed out. You could try asking for something more concise, or try again in a moment."
-            if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_to_send_to_user):
-                 llm_history.append({"role": "assistant", "content": final_text_to_send_to_user})
-            if chat_id: await context.bot.send_message(chat_id, final_text_to_send_to_user)
-        else: 
-            logger.error(f"Chat {chat_id}: OpenAI InternalServerError: {e_openai_ise}", exc_info=True)
-            # Add a generic message to history and send to user
+        else: # Handle other internal server errors
+            logger.error(f"{logger_chat_thread_info}: OpenAI InternalServerError: {e_openai_ise}", exc_info=True)
             final_text_to_send_to_user = "Sorry, the AI service encountered an internal error. Please try again later."
-            if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_to_send_to_user):
-                 llm_history.append({"role": "assistant", "content": final_text_to_send_to_user})
-            if chat_id: await context.bot.send_message(chat_id, final_text_to_send_to_user)
-            # We don't re-raise here as we've handled it by informing the user.
-    except openai.APITimeoutError as e_openai_timeout:
-        logger.error(f"Chat {chat_id}: OpenAI APITimeoutError. Client-side timeout for Shapes API.", exc_info=True)
+        
+        # Append error message to history if different from last assistant message
+        if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_to_send_to_user):
+                llm_history.append({"role": "assistant", "content": final_text_to_send_to_user})
+        # Notify user
+        if chat_id: 
+            try:
+                await send_message_to_chat_or_general(context.bot, chat_id, final_text_to_send_to_user, preferred_thread_id=current_message_thread_id)
+            except Exception as e_send_err: logger.error(f"Error sending ISE message: {e_send_err}")
+        # We don't re-raise here as we've handled it by informing the user.
+
+    except APITimeoutError as e_openai_timeout:
+        # Handle client-side timeout waiting for the API
+        logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): OpenAI APITimeoutError. Client-side timeout for Shapes API.", exc_info=True)
         final_text_to_send_to_user = "The AI is taking too long to respond and the request timed out on my side. Please try asking for something shorter or try again later."
+        # Append error message to history if different
         if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_to_send_to_user):
              llm_history.append({"role": "assistant", "content": final_text_to_send_to_user})
-        if chat_id: await context.bot.send_message(chat_id, final_text_to_send_to_user) 
-    except telegram.error.BadRequest as e_outer_tg_badreq: # This might catch errors from send_message if text is malformed beyond MDV2
-        logger.error(f"Outer Telegram BadRequest for chat {chat_id}: {e_outer_tg_badreq}. Raw AI response: '{final_text_to_send_to_user[:100]}'", exc_info=True)
+        # Notify user
+        if chat_id: 
+            try:
+                await send_message_to_chat_or_general(context.bot, chat_id, final_text_to_send_to_user, preferred_thread_id=current_message_thread_id)
+            except Exception as e_send_err: logger.error(f"Error sending Timeout message: {e_send_err}")
+        # We don't re-raise here as we've handled it by informing the user.
+
+    # --- Telegram Specific Error Handling ---
+    except telegram.error.BadRequest as e_outer_tg_badreq: 
+        # This catch block is for BadRequest errors that might occur *outside* the robust sending logic 
+        # (e.g., during initial chat action send, or if the sending logic itself had an issue causing a re-raise).
+        # It can also catch errors if the final plain text fallback send fails within the logic above.
+        logger.error(f"Outer Telegram BadRequest for chat {chat_id} (thread {current_message_thread_id}): {e_outer_tg_badreq}. Raw AI response: '{final_text_to_send_to_user[:500]}'", exc_info=True)
         try: 
-            plain_fb_full_outer = final_text_to_send_to_user # Attempt to send the original AI response as plain text
+            plain_fb_full_outer = final_text_to_send_to_user # Use the original AI response
+            # Re-attempt sending the *entire* original message as plain text directly to general chat as a last resort.
             if len(plain_fb_full_outer) <= max_mdv2_len: # Telegram's absolute max length
-                await context.bot.send_message(chat_id, text=plain_fb_full_outer)
-            else: # If even plain text is too long, split it
-                logger.warning(f"Chat {chat_id}: Outer plain text fallback also too long ({len(plain_fb_full_outer)}), splitting.")
+                await context.bot.send_message(chat_id, text=plain_fb_full_outer, message_thread_id=None) # Try general explicitly
+            else: 
+                # If even plain text is too long, split it for general chat
+                logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Outer plain text fallback also too long ({len(plain_fb_full_outer)}), splitting for general.")
                 num_chunks_outer = (len(plain_fb_full_outer) + max_mdv2_len -1) // max_mdv2_len
                 for i, chunk in enumerate([plain_fb_full_outer[j:j+max_mdv2_len] for j in range(0, len(plain_fb_full_outer), max_mdv2_len)]):
                     hdr = f"[Fallback Part {i+1}/{num_chunks_outer}]\n" if num_chunks_outer > 1 else ""
-                    await context.bot.send_message(chat_id, text=hdr + chunk)
-                    if i < num_chunks_outer -1 : await asyncio.sleep(0.5)
-            logger.info(f"Chat {chat_id}: Sent entire message as plain text (outer error fallback).")
-        except Exception as e_fb_outer_send: # If sending plain text also fails
-            logger.error(f"Chat {chat_id}: Outer plain text fallback send also failed: {e_fb_outer_send}")
-            await context.bot.send_message(chat_id, "A general error occurred while formatting my response. (OBRF)")
+                    await context.bot.send_message(chat_id, text=hdr + chunk, message_thread_id=None) # Try general explicitly
+                    if i < num_chunks_outer -1 : await asyncio.sleep(0.5) # Brief pause between chunks
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Sent entire message as plain text to general (outer error fallback).")
+        except Exception as e_fb_outer_send: 
+            # If sending the outer plain text fallback *also* fails
+            logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): Outer plain text fallback send also failed: {e_fb_outer_send}")
+            # Send a very generic error message to general chat
+            try:
+                await context.bot.send_message(chat_id, "A general error occurred while formatting my response. (OBRF)", message_thread_id=None)
+            except Exception as e_final_send_err : logger.error(f"Even final OBRF message failed: {e_final_send_err}")
+
+    # --- Network/Communication Error Handling ---
     except (httpx.NetworkError, httpx.TimeoutException, httpx.ConnectError, telegram.error.NetworkError, telegram.error.TimedOut) as e_net_comm:
-        logger.error(f"Network-related error for chat {chat_id}: {e_net_comm}", exc_info=False) # exc_info=False as traceback might be less useful
-        if chat_id: # Ensure chat_id is available
+        # Catch common network errors from both httpx (API calls) and telegram (Bot communication)
+        logger.error(f"Network-related error for chat {chat_id} (thread {current_message_thread_id}): {e_net_comm}", exc_info=False) # exc_info=False as traceback might be less useful here
+        # Notify the user about network issues if possible
+        if chat_id: 
             try:
-                await context.bot.send_message(chat_id, "⚠️ I'm having some network issues. Please try again in a little while.")
+                await send_message_to_chat_or_general(context.bot, chat_id, "⚠️ I'm having some network issues. Please try again in a little while.", preferred_thread_id=current_message_thread_id)
             except Exception as e_send_net_err_msg: # If sending the notification itself fails
-                 logger.error(f"Chat {chat_id}: Failed to send network error notification: {e_send_net_err_msg}")
-    except Exception as e_main_handler: # Catch-all for truly unexpected errors in this handler
-        logger.error(f"General, unhandled error in process_message_entrypoint for chat {chat_id}: {e_main_handler}", exc_info=True)
-        if chat_id: # Ensure chat_id is available
+                 logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): Failed to send network error notification: {e_send_net_err_msg}")
+
+    # --- General Catch-All Exception Handling ---
+    except Exception as e_main_handler: 
+        # Catch any other unexpected error within the main handler
+        logger.error(f"General, unhandled error in process_message_entrypoint for chat {chat_id} (thread {current_message_thread_id}): {e_main_handler}", exc_info=True)
+        # Notify the user about the generic error if possible
+        if chat_id: 
             try:
-                await context.bot.send_message(chat_id, "😵‍💫 Oops! Something went wrong. I've noted it. Please try again. (MGEN)")
+                await send_message_to_chat_or_general(context.bot, chat_id, "😵‍💫 Oops! Something went wrong. I've noted it. Please try again. (MGEN)", preferred_thread_id=current_message_thread_id)
             except Exception as e_send_gen_err_msg: # If sending the notification itself fails
-                logger.error(f"Chat {chat_id}: Failed to send general error notification: {e_send_gen_err_msg}")
+                logger.error(f"Chat {chat_id} (thread {current_message_thread_id}): Failed to send general error notification: {e_send_gen_err_msg}")
     finally:
+        # Ensure typing indicator is always cancelled
         if typing_task and not typing_task.done():
             typing_task.cancel()
-            logger.debug(f"Chat {chat_id}: Typing task cancelled in finally block.")
+            logger.debug(f"Chat {chat_id} (thread {current_message_thread_id}): Typing task cancelled in finally block.")
 # --- END OF Main Message Handler ---
 
 # --- ERROR HANDLER ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Log the error with traceback
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
     tb_string = "".join(tb_list)
+    
+    # Format update object for logging
     update_str = "Update data not available or not an Update instance."
     effective_chat_id_for_error = "N/A" # Default
+    message_thread_id_for_error: Optional[int] = None
+
     if isinstance(update, Update):
         try: update_str = json.dumps(update.to_dict(), indent=2, ensure_ascii=False, default=str)
         except Exception: update_str = str(update) # Fallback if to_dict fails
         if update.effective_chat:
             effective_chat_id_for_error = str(update.effective_chat.id)
+        # Get thread ID from effective_message if available (covers commands, etc.)
+        if update.effective_message and update.effective_message.message_thread_id is not None: 
+            message_thread_id_for_error = update.effective_message.message_thread_id
     elif update: # If update is not None but not an Update instance
         update_str = str(update)
 
+    # Format context data (truncated)
     chat_data_str = str(context.chat_data)[:500] if context.chat_data else "N/A"
     user_data_str = str(context.user_data)[:500] if context.user_data else "N/A"
-
+    
+    # Prepare error message for admin (plain text)
+    thread_info_for_error_log = f"(thread {message_thread_id_for_error})" if message_thread_id_for_error is not None else ""
     send_message_plain = (
-        f"Bot Exception in chat {effective_chat_id_for_error}:\n"
+        f"Bot Exception in chat {effective_chat_id_for_error} {thread_info_for_error_log}:\n"
         f"Update: {update_str[:1500]}...\n\n"
         f"Chat Data: {chat_data_str}\nUser Data: {user_data_str}\n\n"
         f"Traceback (last 1500 chars):\n{tb_string[-1500:]}"
     )
 
+    # Determine admin chat ID for notification
     chat_id_to_notify_admin: Optional[int] = None
     if ALLOWED_USERS: # Check if ALLOWED_USERS is populated
         try: chat_id_to_notify_admin = int(ALLOWED_USERS[0]) # Attempt to get the first admin user ID
         except (ValueError, IndexError, TypeError): logger.error("No valid admin user ID for error notification from ALLOWED_USERS[0].")
 
-    # Attempt to notify the user in the chat where the error occurred, if appropriate
+    # --- Notify User (Optional) ---
     user_notified_by_handler = False
     if isinstance(update, Update) and update.effective_chat:
         # Avoid sending generic error if it's a network/API timeout, as those are handled in process_message_entrypoint
-        if not isinstance(context.error, (openai.InternalServerError, openai.APITimeoutError, telegram.error.NetworkError, httpx.NetworkError)):
+        # Check against imported exceptions
+        if not isinstance(context.error, (InternalServerError, APITimeoutError, telegram.error.NetworkError, httpx.NetworkError, httpx.TimeoutException)): # Added httpx.TimeoutException
             try:
+                # Send a user-friendly HTML message
                 user_error_message = f"<b>Bot Error:</b> <pre>{html.escape(str(context.error))}</pre>\n<i>An unexpected error occurred. The admin has been notified if configured.</i>"
                 if len(user_error_message) <= 4096: # Telegram message length limit
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=user_error_message, parse_mode=ParseMode.HTML)
+                    # Use send_message_to_chat_or_general for user notification too, respecting thread
+                    await send_message_to_chat_or_general(
+                        context.bot, 
+                        update.effective_chat.id, 
+                        user_error_message, 
+                        preferred_thread_id=message_thread_id_for_error, # Pass thread ID
+                        parse_mode=ParseMode.HTML
+                    )
                     user_notified_by_handler = True
             except Exception as e_send_user_err:
-                logger.error(f"Failed to send user-friendly error to chat {update.effective_chat.id}: {e_send_user_err}")
+                logger.error(f"Failed to send user-friendly error to chat {update.effective_chat.id} (thread {message_thread_id_for_error}): {e_send_user_err}")
 
-    # Send detailed error to admin if configured
+    # --- Notify Admin ---
     if chat_id_to_notify_admin:
         # Avoid duplicate notification if admin is the one who experienced the error and was already notified
         if user_notified_by_handler and update.effective_chat and update.effective_chat.id == chat_id_to_notify_admin:
-            logger.info(f"Admin was the user in chat {chat_id_to_notify_admin} and already notified about the error. Skipping redundant admin report.")
+            logger.info(f"Admin was the user in chat {chat_id_to_notify_admin} (thread {message_thread_id_for_error}) and already notified about the error. Skipping redundant admin report.")
         else:
             max_len = 4096 # Telegram message length limit
             try:
                 # Prefer HTML for admin if error is short and not potentially full of HTML itself
-                is_potentially_html_error = isinstance(context.error, (openai.InternalServerError, httpx.HTTPStatusError)) # These might contain HTML in response
+                # Use imported InternalServerError
+                is_potentially_html_error = isinstance(context.error, (InternalServerError, httpx.HTTPStatusError)) # These might contain HTML in response
                 
+                thread_info_html = f"(thread {message_thread_id_for_error})" if message_thread_id_for_error is not None else ""
+                # Admin messages always go to the admin's direct chat, so no thread_id needed for the send_message call below
+                
+                # Try sending a short HTML version first if suitable
                 if not is_potentially_html_error and len(send_message_plain) < max_len - 200 : # If plain text is short enough for HTML wrapper
-                    short_html_err = f"<b>Bot Error in chat {effective_chat_id_for_error}:</b>\n<pre>{html.escape(str(context.error))}</pre>\n<i>(Full details in server logs. Update/TB follows if space.)</i>"
+                    short_html_err = f"<b>Bot Error in chat {effective_chat_id_for_error} {thread_info_html}:</b>\n<pre>{html.escape(str(context.error))}</pre>\n<i>(Full details in server logs. Update/TB follows if space.)</i>"
                     if len(short_html_err) <=max_len : # Check if HTML version is within limits
                          await context.bot.send_message(chat_id=chat_id_to_notify_admin, text=short_html_err, parse_mode=ParseMode.HTML)
                     else: # HTML version too long, revert to plain
-                        is_potentially_html_error = True # Force plain text path
+                        is_potentially_html_error = True # Force plain text path 
 
-                if is_potentially_html_error or len(send_message_plain) >= max_len -200 : # Send as plain text if it's long or potentially HTML
+                # Send as plain text if it's long or potentially contains HTML
+                if is_potentially_html_error or len(send_message_plain) >= max_len -200 : 
                     if len(send_message_plain) <= max_len:
                         await context.bot.send_message(chat_id=chat_id_to_notify_admin, text=send_message_plain)
                     else: # Split long plain text message for admin
                         num_err_chunks = (len(send_message_plain) + max_len -1) // max_len
                         for i_err, chunk in enumerate([send_message_plain[j:j+max_len] for j in range(0, len(send_message_plain), max_len)]):
-                            hdr = f"[BOT ERR Pt {i_err+1}/{num_err_chunks}]\n" if num_err_chunks > 1 else "[BOT ERR]\n"
-                            await context.bot.send_message(chat_id=chat_id_to_notify_admin, text=(hdr + chunk)[:max_len]) # Ensure chunk with header doesn't exceed max_len
+                            # Add context header to each chunk
+                            hdr = f"[BOT ERR Pt {i_err+1}/{num_err_chunks} Chat {effective_chat_id_for_error} {thread_info_for_error_log}]\n" if num_err_chunks > 1 else f"[BOT ERR Chat {effective_chat_id_for_error} {thread_info_for_error_log}]\n"
+                            # Ensure chunk with header doesn't exceed max_len
+                            await context.bot.send_message(chat_id=chat_id_to_notify_admin, text=(hdr + chunk)[:max_len]) 
                             if i_err < num_err_chunks -1 : await asyncio.sleep(0.5) # Brief pause between chunks
             except Exception as e_send_err: # Fallback if sending detailed error fails
                 logger.error(f"Failed sending detailed error report to admin {chat_id_to_notify_admin}: {e_send_err}")
-                try: await context.bot.send_message(chat_id=chat_id_to_notify_admin, text=f"Bot Error: {str(context.error)[:1000]}\n(Details in server logs. Report sending failed.)")
+                # Send a minimal plain text error to admin
+                try: await context.bot.send_message(chat_id=chat_id_to_notify_admin, text=f"Bot Error in chat {effective_chat_id_for_error} {thread_info_for_error_log}: {str(context.error)[:1000]}\n(Details in server logs. Report sending failed.)")
                 except Exception as e_final_fb: logger.error(f"Final admin error report fallback failed: {e_final_fb}")
-    elif not user_notified_by_handler: # If no admin to notify and user wasn't notified by specific error message
-        logger.error("No chat ID found to send error message via Telegram (admin not set, or user already got specific error from main handler). Error details logged to server.")
+    # Log if no notification was sent anywhere
+    elif not user_notified_by_handler: 
+        logger.error(f"No chat ID found to send error message via Telegram (admin not set, or user already got specific error from main handler). Error details for chat {effective_chat_id_for_error} {thread_info_for_error_log} logged to server.")
 # --- END OF ERROR HANDLER ---
 
+async def post_initialization(application: Application) -> None:
+    """Actions to perform after the bot is initialized, like setting commands."""
+    bot_commands = [
+        BotCommand("start", "Display the welcome message."),
+        BotCommand("help", "Show this help message."),
+        BotCommand("newchat", "Clear conversation history for this topic/chat."),
+        BotCommand("activate", "(Groups/Topics) Respond to all messages here."),
+        BotCommand("deactivate", "(Groups/Topics) Stop responding to all messages here."),
+    ]
+    if BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE: # Only show /imagine if fully configured
+        bot_commands.append(BotCommand("imagine", "Generate images from a prompt (Bing)."))
+    
+    # setbingcookie is an admin command, only show if BING is available and there are admins
+    if BING_IMAGE_CREATOR_AVAILABLE and ALLOWED_USERS: 
+         bot_commands.append(BotCommand("setbingcookie", "(Admin) Update Bing auth cookie."))
+    
+    try:
+        await application.bot.set_my_commands(bot_commands)
+        logger.info(f"Successfully set bot commands: {[cmd.command for cmd in bot_commands]}")
+    except Exception as e:
+        logger.error(f"Failed to set bot commands: {e}")
+
+
 if __name__ == "__main__":
+    # Record bot startup time (UTC)
+    BOT_STARTUP_TIMESTAMP = datetime.now(dt_timezone.utc)
+    logger.info(f"Bot starting up at: {BOT_STARTUP_TIMESTAMP}")
+    if IGNORE_OLD_MESSAGES_ON_STARTUP:
+        logger.info("Bot will ignore messages received before this startup time.")
+
     app_builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+    app_builder.post_init(post_initialization) # Register post_init hook
     app = app_builder.build()
 
     # Command Handlers
+    # The CommandHandler itself, by default, correctly handles /command@botname scenarios.
+    # The internal checks added to each command handler are an additional layer to ensure
+    # the bot doesn't respond to commands explicitly aimed at *another* bot if somehow
+    # the CommandHandler still triggered (e.g., if the command string was just "command"
+    # but the text contained "@otherbot" later, though this is unlikely for command parsing).
+    # The main benefit of the internal check is slightly more explicit logging.
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("newchat", new_chat_command))
-    if BING_IMAGE_CREATOR_AVAILABLE: # Only add imagine/setbingcookie if library is available
-        if BING_AUTH_COOKIE: # Only add /imagine if cookie is also set
+    app.add_handler(CommandHandler("activate", activate_command))
+    app.add_handler(CommandHandler("deactivate", deactivate_command))
+    # Only add imagine/setbingcookie if library is available
+    if BING_IMAGE_CREATOR_AVAILABLE: 
+        # Only add /imagine if cookie is also set initially
+        if BING_AUTH_COOKIE: 
             app.add_handler(CommandHandler("imagine", imagine_command))
-        app.add_handler(CommandHandler("setbingcookie", set_bing_cookie_command)) # Admin can set cookie even if not initially present
+        # Admin can set cookie even if not initially present
+        app.add_handler(CommandHandler("setbingcookie", set_bing_cookie_command)) 
 
-    # Message Handler for text, photos, voice, and replies (not commands)
+    # --- Handler for Forum Topic Updates (Created/Edited) ---
+    # This handler is specifically for populating the topic_names_cache.
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.REPLY) & (~filters.COMMAND),
+        filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
+        handle_forum_topic_updates
+    ))
+    # Message Handler for text, photos, voice, and replies (but not commands)
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.REPLY) & (~filters.COMMAND) & (~filters.StatusUpdate.ALL),
         process_message_entrypoint
     ))
 
@@ -1767,8 +2587,11 @@ if __name__ == "__main__":
 
     logger.info("Bot is starting to poll for updates...")
     try:
+        # Start polling
         app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except telegram.error.NetworkError as ne: # Specific catch for initial network errors during startup
+    # Specific catch for initial network errors during startup
+    except telegram.error.NetworkError as ne: 
         logger.critical(f"CRITICAL: Initial NetworkError during polling setup: {ne}. Check network/token.", exc_info=True)
-    except Exception as main_e: # Catch any other critical errors during startup/polling loop
+    # Catch any other critical errors during startup/polling loop
+    except Exception as main_e: 
         logger.critical(f"CRITICAL: Unhandled exception at main polling level: {main_e}", exc_info=True)
