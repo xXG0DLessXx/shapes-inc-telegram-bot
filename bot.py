@@ -733,9 +733,13 @@ async def get_weather_tool(
 
 async def web_search(query: str, site: str = '', region: str = '', date_filter: str = '') -> str:
     logger.info(f"TOOL: web_search for query='{query}', site='{site}', region='{region}', date_filter='{date_filter}'")
+
+    # Construct the search query string
+    if site:
+        query = f"{query} site:{site}"
+
     params = {
         'q': query,
-        'b': site,
         'kl': region,
         'df': date_filter,
         'kp': '-2' # No safe search
@@ -1055,22 +1059,70 @@ def format_freewill_context_from_raw_log(
 
     formatted_context_parts = [f"[Recent conversation excerpt from {topic_desc_log}:]"]
     triggering_user_name = "Unknown User" # Default value
-    triggering_message_text = "[message content not available]" # Default value
+    # Initialize triggering_message_text with the original text of the last message in context
+    # This will be updated if the last message text gets neutralized.
+    if context_messages_to_format: # Ensure list is not empty
+        triggering_message_text = context_messages_to_format[-1].get("text", "[message content not available]")
+    else: # Should not happen due to earlier check, but for safety:
+        triggering_message_text = "[message content not available]"
+
 
     for i, msg_data in enumerate(context_messages_to_format):
         sender = msg_data.get("sender_name", "Unknown User")
         text = msg_data.get("text", "[message content not available]")
-        max_len_per_msg_in_context = 250
+        original_text_for_this_message = text # Keep a copy of the original for this message
+
+        # --- START OF MODIFICATION TO ADDRESS PREFIX COMMANDS IN FREE WILL CONTEXT ---
+        # If this message is part of free will context and contains a known prefix command,
+        # neutralize it to prevent the Shapes API's built-in commands from triggering.
+        # We replace the command with a version that's still readable for AI context
+        # but shouldn't be directly executable by the Shapes API.
+        # (Original issue: "The shapes api which I use has some builtin prefix commands like '!wack' '!dashboard' etc...")
+        # (Original issue: "...these also get triggered when the bot uses free will if the command was sent in one of the messages taken into free will context...")
+        # (Refinement: Neutralize any command starting with '!' to '!_' regardless of where it is in the text, for ALL such commands)
+
+        # Find all words starting with '!' (potential commands)
+        # A "word" starting with '!' means '!' followed by one or more non-whitespace characters.
+        # We use a regex that captures the '!' and the command word.
+        # The replacement function will then prepend '_' to the captured command word.
+        def neutralize_command(match: re.Match) -> str:
+            # match.group(0) is the full matched command, e.g., "!wack"
+            # We want to return "!_wack"
+            return f"!_{match.group(0)[1:]}" # Prepend "_" after the "!"
+
+        # Apply this to all occurrences in the text.
+        # The regex (?<=\s|^) ensures the '!' is at the beginning of a word (preceded by space or start of string).
+        # (\!\w+) captures the '!' and the subsequent word characters.
+        # Using re.sub with a function allows dynamic replacement.
+        # This regex will match "!command" and replace it with "!_command".
+        # It handles multiple commands in a single message text.
+        modified_text = re.sub(r"(?<!\S)(!\w+)", neutralize_command, text)
+        
+        if modified_text != text: # Log if any command was actually neutralized in this message
+            logger.debug(f"Free will context: Neutralized prefix commands in message from '{sender}'. Original: '{text[:100]}...', Modified: '{modified_text[:100]}...'")
+            text = modified_text # Use the modified text
+        # --- END OF MODIFICATION TO ADDRESS PREFIX COMMANDS IN FREE WILL CONTEXT ---
+            
+        max_len_per_msg_in_context = 4096
         if len(text) > max_len_per_msg_in_context:
             text = text[:max_len_per_msg_in_context].strip() + "..."
         formatted_context_parts.append(f"- '{sender}' said: \"{text}\"")
-        # Capture the last message details
+        
+        # Capture the last message details for the final prompt part.
+        # If the last message in the context was modified, use its modified form for `triggering_message_text`.
         if i == len(context_messages_to_format) - 1: 
             triggering_user_name = sender
-            triggering_message_text = msg_data.get("text", "[message content not available]") 
-            # Truncate if the triggering message text itself is very long
-            if len(triggering_message_text) > 500: 
-                triggering_message_text = triggering_message_text[:500].strip() + "..."
+            # If the text of the *last message* was modified by neutralization,
+            # `triggering_message_text` should reflect this modified version.
+            # Otherwise, it keeps its initially assigned value (original text of the last message).
+            if modified_text != original_text_for_this_message :
+                triggering_message_text = text # Use the modified, potentially truncated text
+            # else, triggering_message_text remains the original full text of the last message.
+            # (No need for an `else` here as it's pre-assigned and only updated if modified)
+            
+            # Truncate if the (potentially modified) triggering message text itself is very long
+            if len(triggering_message_text) > 4096: 
+                triggering_message_text = triggering_message_text[:4096].strip() + "..."
     
     # Include the topic description in the final prompt
     formatted_context_parts.append(
@@ -1623,7 +1675,7 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         # --- END MODIFICATION ---
 
         # Apply the location addon to the speaker prefix
-        speaker_context_prefix = f"[User '{current_speaker_display_name}' (ID: {current_user.id}) on Telegram{location_addon_for_speaker_prefix} says:]\n"
+        speaker_context_prefix = f"[Person with display name '{current_speaker_display_name}' (ID: {current_user.id}) on Telegram{location_addon_for_speaker_prefix} says:]\n"
 
         # Add reply context if applicable
         replied_msg: Optional[TelegramMessage] = None 
@@ -1645,25 +1697,22 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                 # for context generation *specifically when the bot was pinged*.
                 # For activated chats, we might still want context even if replying to a service message.
                 is_ignorable_service_message = False
-                if replied_msg: # Ensure replied_msg is not None
-                    # List of common service message attributes to check
+                if replied_msg:  # Ensure replied_msg is not None
+                    # Store attribute names as strings, NOT direct references to replied_msg attributes
                     service_message_attributes = [
-                        replied_msg.forum_topic_created, replied_msg.forum_topic_reopened,
-                        replied_msg.forum_topic_edited, replied_msg.forum_topic_closed,
-                        replied_msg.general_forum_topic_hidden, replied_msg.general_forum_topic_unhidden,
-                        replied_msg.write_access_allowed, replied_msg.group_chat_created,
-                        replied_msg.supergroup_chat_created, replied_msg.message_auto_delete_timer_changed,
-                        replied_msg.migrate_to_chat_id, replied_msg.migrate_from_chat_id,
-                        replied_msg.pinned_message, replied_msg.new_chat_members,
-                        replied_msg.left_chat_member, replied_msg.new_chat_title,
-                        replied_msg.new_chat_photo, replied_msg.delete_chat_photo,
-                        replied_msg.video_chat_scheduled, replied_msg.video_chat_started,
-                        replied_msg.video_chat_ended, replied_msg.video_chat_participants_invited,
-                        replied_msg.web_app_data
-                        # Add other specific service attributes if needed
+                    "forum_topic_created", "forum_topic_reopened", "forum_topic_edited", "forum_topic_closed",
+                    "general_forum_topic_hidden", "general_forum_topic_unhidden", "write_access_allowed",
+                    "group_chat_created", "supergroup_chat_created", "message_auto_delete_timer_changed",
+                    "migrate_to_chat_id", "migrate_from_chat_id", "pinned_message", "new_chat_members",
+                    "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo",
+                    "video_chat_scheduled", "video_chat_started", "video_chat_ended",
+                    "video_chat_participants_invited", "web_app_data"
                     ]
-                    if any(attr is not None for attr in service_message_attributes):
+
+                    # Check if any attribute exists and has a truthy value
+                    if any(getattr(replied_msg, attr, False) for attr in service_message_attributes):
                         is_ignorable_service_message = True
+
                 
                 if is_mention_to_bot and is_ignorable_service_message:
                     # This is a PING, and the auto-reply (from Telegram client, or user explicitly replying to service msg)
@@ -1736,7 +1785,7 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             # provided no new text, caption, photo, or voice.
             if replied_msg and not (user_message_text_original or user_message_caption_original): # Check original text for this part
                  # This specific placeholder is from your original code.
-                 full_text_for_llm += "(User replied without new text/caption)"
+                 full_text_for_llm += "(This reply was without new text/caption)"
             # else: # Other cases of empty message with context are less common or might not need a placeholder.
             #     pass 
         

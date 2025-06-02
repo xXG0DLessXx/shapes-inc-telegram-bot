@@ -1,9 +1,30 @@
 version: '3.8'
 
+# Define a common base configuration for all bot services
+x-common-bot-config: &common-bot-config
+  build: . # Build the image from the Dockerfile in the current directory
+  restart: unless-stopped
+  # Removed network_mode: "host". We'll use a custom bridge network.
+  networks:
+    - telegram_bots_network # Assign all bots to this custom network
+  deploy: # Resource limits and reservations
+    resources:
+      limits:
+        cpus: '0.50' # Limit to 50% of one CPU core
+        memory: '256M' # Limit memory usage to 256 MB
+      #reservations: # Optional: Guarantee these resources
+      #  cpus: '0.25' # Reserve 25% of one CPU core
+      #  memory: '128M' # Reserve 128 MB of memory
+  #logging: # Configure logging for containers
+  #  driver: "json-file" # Default, but can be explicit
+  #  options:
+  #    max-size: "10m"   # Max size of a log file before rotation
+  #    max-file: "3"     # Max number of log files to keep
+
 services:
   # --- Bot Instance 1: Nova ---
   bot-nova-ai:
-    build: .
+    <<: *common-bot-config # Inherit common configuration
     container_name: telegram_bot_nova-ai
     restart: unless-stopped
     env_file:
@@ -12,27 +33,30 @@ services:
     # NO 'environment' block needed here for BOT_TOKEN or SHAPESINC_SHAPE_USERNAME
     # unless you want to override something from nova-ai.env for a quick test,
     # but generally keep secrets out of here.
-    network_mode: "host"
 
   # --- Bot Instance 2: Amy ---
   bot-discordaddictamy:
-    build: .
+    <<: *common-bot-config # Inherit common configuration
     container_name: telegram_bot_discordaddictamy
     restart: unless-stopped
     env_file:
       - common.env
       - discordaddictamy.env
-    network_mode: "host"
 
   # --- Add more bot instances as needed ---
   # bot-anotherone:
-  #   build: .
+  #   <<: *common-bot-config # Inherit common configuration
   #   container_name: telegram_bot_anotherone
   #   restart: unless-stopped
   #   env_file:
   #     - common.env
   #     - anotherone.env
-  #   network_mode: "host"
+
+# Define custom networks
+networks:
+  telegram_bots_network:
+    driver: bridge # Use the default bridge driver
+    name: telegram_bots_network # Give the network a custom name
 
 # The 'volumes: - ./logs:/app/logs' from your original docker-compose.yml
 # was an example. Your bot currently logs to standard output (stdout/stderr),
