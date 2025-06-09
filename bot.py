@@ -22,7 +22,7 @@ from urllib.parse import urlparse, parse_qs, unquote as url_unquote
 
 
 # Telegram imports
-from telegram import Update, InputMediaPhoto, Message as TelegramMessage, User as TelegramUser, Chat, Voice, Bot, BotCommand
+from telegram import Update, InputMediaPhoto, Message as TelegramMessage, User as TelegramUser, Chat, Voice, Bot, BotCommand, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, Application
 )
@@ -404,6 +404,81 @@ async def send_message_to_chat_or_general(
         raise e_other_send
 # --- END OF NEW HELPER FUNCTION ---
 
+# Add helper functions for media with fallback logic
+async def send_photo_to_chat_or_general(
+    bot_instance: Bot,
+    chat_id: int,
+    photo: Union[str, bytes],
+    preferred_thread_id: Optional[int],
+    **kwargs
+) -> Optional[TelegramMessage]:
+    try:
+        return await bot_instance.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            message_thread_id=preferred_thread_id,
+            **kwargs
+        )
+    except telegram.error.BadRequest as e:
+        if "message thread not found" in e.message.lower() and preferred_thread_id is not None:
+            logger.warning(
+                f"Chat {chat_id}: Preferred thread {preferred_thread_id} not found for photo. "
+                f"Attempting to send to general chat instead. Error: {e}"
+            )
+            try:
+                # Fallback: send to general chat (message_thread_id=None)
+                return await bot_instance.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    message_thread_id=None,
+                    **kwargs
+                )
+            except Exception as e2:
+                logger.error(f"Chat {chat_id}: Sending photo to general chat also failed. Error: {e2}")
+                raise e2
+        else:
+            raise e
+    except Exception as e_other:
+        logger.error(f"Chat {chat_id} (thread {preferred_thread_id}): Unexpected error during send_photo. Error: {e_other}")
+        raise e_other
+
+async def send_audio_to_chat_or_general(
+    bot_instance: Bot,
+    chat_id: int,
+    audio: Union[str, bytes],
+    preferred_thread_id: Optional[int],
+    **kwargs
+) -> Optional[TelegramMessage]:
+    try:
+        return await bot_instance.send_audio(
+            chat_id=chat_id,
+            audio=audio,
+            message_thread_id=preferred_thread_id,
+            **kwargs
+        )
+    except telegram.error.BadRequest as e:
+        if "message thread not found" in e.message.lower() and preferred_thread_id is not None:
+            logger.warning(
+                f"Chat {chat_id}: Preferred thread {preferred_thread_id} not found for audio. "
+                f"Attempting to send to general chat instead. Error: {e}"
+            )
+            try:
+                # Fallback: send to general chat (message_thread_id=None)
+                return await bot_instance.send_audio(
+                    chat_id=chat_id,
+                    audio=audio,
+                    message_thread_id=None,
+                    **kwargs
+                )
+            except Exception as e2:
+                logger.error(f"Chat {chat_id}: Sending audio to general chat also failed. Error: {e2}")
+                raise e2
+        else:
+            raise e
+    except Exception as e_other:
+        logger.error(f"Chat {chat_id} (thread {preferred_thread_id}): Unexpected error during send_audio. Error: {e_other}")
+        raise e_other
+
 # --- TOOL IMPLEMENTATIONS ---
 async def create_poll_tool(
     question: str,
@@ -731,7 +806,7 @@ async def get_weather_tool(
             logger.error(f"Unexpected Weather Tool Error: {e}", exc_info=True)
             return json.dumps({"error": "An unexpected error occurred in weather tool.", "details": str(e)})
 
-async def web_search(query: str, site: str = '', region: str = '', date_filter: str = '') -> str:
+async def web_search_tool(query: str, site: str = '', region: str = '', date_filter: str = '') -> str:
     logger.info(f"TOOL: web_search for query='{query}', site='{site}', region='{region}', date_filter='{date_filter}'")
 
     # Construct the search query string
@@ -811,134 +886,544 @@ async def web_search(query: str, site: str = '', region: str = '', date_filter: 
         logger.error(f"Web Search: Unexpected error during web search for '{query}': {e}", exc_info=True)
         return json.dumps({'error': 'An unexpected error occurred during web search.'})
 
+async def get_game_deals_tool(
+    deal_id: Optional[int] = None,
+    fetch_worth: bool = False,
+    platform: Optional[str] = None, 
+    type: Optional[str] = None, 
+    sort_by: Optional[str] = None
+) -> str:
+    """
+    Fetches information about free game giveaways. Can fetch a list of deals, a single deal by ID, or the total worth of all deals.
+    - To get a list of current giveaways, use the 'platform', 'type', and 'sort_by' parameters.
+    - To get the total number and value of giveaways, set 'fetch_worth' to true.
+    - To get details for a specific giveaway, provide its 'deal_id' (The deal_id's are unknown until you fetch the deals first).
+    """
+    logger.info(
+        f"TOOL: get_game_deals_tool with id={deal_id}, fetch_worth={fetch_worth}, "
+        f"platform={platform}, type={type}, sort_by={sort_by}"
+    )
+    
+    base_url = "https://www.gamerpower.com/api"
+    params = {}
+
+    # Determine the correct API endpoint based on the parameters provided
+    if deal_id is not None:
+        api_url = f"{base_url}/giveaway"
+        params["id"] = deal_id
+    elif fetch_worth:
+        api_url = f"{base_url}/worth"
+        if platform: params["platform"] = platform
+        if type: params["type"] = type
+    else:
+        api_url = f"{base_url}/giveaways"
+        if platform: params["platform"] = platform
+        if type: params["type"] = type
+        if sort_by: params["sort-by"] = sort_by
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+            response = await client.get(api_url, params=params)
+            
+            # GamerPower API returns 404 for a non-existent ID, which is a valid "not found" case
+            if response.status_code == 404:
+                return json.dumps({"result": "No giveaway found with the specified ID."})
+
+            response.raise_for_status()
+            data = response.json()
+
+        if not data:
+            return json.dumps({"result": "No data returned from the API for the specified criteria."})
+
+        # The 'worth' endpoint returns a single object, not a list
+        if fetch_worth:
+            return json.dumps({"worth_estimation": data})
+
+        # A single giveaway ID returns a single object
+        if deal_id:
+            return json.dumps({"giveaway_details": data})
+
+        # Otherwise, we have a list of giveaways
+        results_limit = 7 # Limit to a reasonable number for chat
+        formatted_results = []
+        for item in data[:results_limit]:
+            formatted_results.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "platforms": item.get("platforms"),
+                "end_date": item.get("end_date"),
+                "url": item.get("open_giveaway_url")
+            })
+        return json.dumps({"giveaways": formatted_results})
+
+    except httpx.HTTPStatusError as e:
+        error_details = f"API request failed with status code {e.response.status_code}."
+        logger.error(f"GamerPower API Error: {error_details}", exc_info=True)
+        return json.dumps({"error": "Failed to fetch data from the GamerPower API.", "details": error_details})
+    except Exception as e:
+        logger.error(f"Unexpected error in get_game_deals_tool: {e}", exc_info=True)
+        return json.dumps({"error": "An unexpected error occurred."})
+
+# --- ADD THIS HELPER FUNCTION FOR PARSING DURATION ---
+def _parse_duration(duration_str: str) -> timedelta:
+    """Parses a simple duration string (e.g., '30m', '2h', '1d') into a timedelta."""
+    duration_str = duration_str.lower().strip()
+    match = re.match(r"^(\d+)([mhd])$", duration_str)
+    if not match:
+        raise ValueError("Invalid duration format. Use 'm' for minutes, 'h' for hours, 'd' for days. E.g., '30m', '2h'.")
+    
+    value, unit = int(match.group(1)), match.group(2)
+    if unit == 'm':
+        return timedelta(minutes=value)
+    elif unit == 'h':
+        return timedelta(hours=value)
+    elif unit == 'd':
+        return timedelta(days=value)
+    return timedelta() # Should not be reached
+
+# --- THE MODERATION TOOL IMPLEMENTATION ---
+async def restrict_user_in_chat_tool(
+    user_id: int,
+    duration: str = '1h',
+    reason: Optional[str] = None,
+    # Parameters to be passed by the main handler:
+    telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+    current_chat_id: Optional[int] = None
+) -> str:
+    """Restricts a user in the current chat."""
+    if not telegram_bot_context or not current_chat_id:
+        return json.dumps({"error": "Internal error: Context or Chat ID not provided."})
+    
+    bot = telegram_bot_context.bot
+    logger.info(f"TOOL: restrict_user_in_chat for user {user_id} in chat {current_chat_id} for {duration}. Reason: {reason}")
+
+    # --- SAFETY CHECK 1: Bot cannot restrict itself ---
+    if user_id == bot.id:
+        return json.dumps({"status": "failed", "error": "Action failed: I cannot restrict myself."})
+
+    try:
+        # --- SAFETY CHECK 2: Get bot's status to ensure it's an admin ---
+        bot_member = await bot.get_chat_member(current_chat_id, bot.id)
+        if not isinstance(bot_member, (telegram.ChatMemberAdministrator, telegram.ChatMemberOwner)):
+            return json.dumps({"status": "failed", "error": "Action failed: I am not an administrator in this chat."})
+        if not bot_member.can_restrict_members:
+            return json.dumps({"status": "failed", "error": "Action failed: I am an admin, but I don't have permission to restrict members."})
+            
+        # --- SAFETY CHECK 3: Get target user's status to ensure they are not an admin ---
+        target_member = await bot.get_chat_member(current_chat_id, user_id)
+        if target_member.status in [target_member.ADMINISTRATOR, target_member.CREATOR]:
+             return json.dumps({"status": "failed", "error": f"Action failed: I cannot restrict another administrator or the chat owner ('{target_member.user.full_name}')."})
+
+        # --- Parse duration and set restriction end time ---
+        try:
+            mute_timedelta = _parse_duration(duration)
+            # Telegram expects a Unix timestamp for `until_date`
+            until_date = datetime.now() + mute_timedelta
+            logger.info(f"User {user_id} will be restricted until {until_date.isoformat()}")
+        except ValueError as e:
+            return json.dumps({"status": "failed", "error": str(e)})
+
+        # --- Perform the action ---
+        # To "mute", we set can_send_messages to False. All other perms remain default (None = Unchanged).
+        await bot.restrict_chat_member(
+            chat_id=current_chat_id,
+            user_id=user_id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until_date
+        )
+        
+        success_message = f"User {user_id} ({target_member.user.full_name}) has been successfully muted for {duration}."
+        if reason:
+            success_message += f" Reason: {reason}"
+        
+        return json.dumps({"status": "success", "details": success_message})
+
+    except telegram.error.BadRequest as e:
+        logger.error(f"Error restricting user {user_id} in chat {current_chat_id}: {e.message}")
+        if "user not found" in e.message.lower():
+            return json.dumps({"status": "failed", "error": "User with the specified ID was not found in this chat."})
+        return json.dumps({"status": "failed", "error": f"Telegram API error: {e.message}"})
+    except Exception as e:
+        logger.error(f"Unexpected error in restrict_user_in_chat_tool: {e}", exc_info=True)
+        return json.dumps({"error": "An unexpected internal error occurred."})
+
+async def get_user_info_tool(
+    user_id: int,
+    fetch_profile_photos: bool = False,
+    # Parameters to be passed by the main handler:
+    telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+    current_chat_id: Optional[int] = None
+) -> str:
+    """Gets comprehensive information about a member of the current chat."""
+    if not telegram_bot_context or not current_chat_id:
+        return json.dumps({"error": "Internal error: Context or Chat ID not provided."})
+    
+    bot = telegram_bot_context.bot
+    logger.info(f"TOOL: Comprehensive get_user_info for user {user_id} in chat {current_chat_id}")
+    
+    try:
+        # --- Step 1: Get the ChatMember object ---
+        # This is the most important call, as it confirms the user is in the chat
+        # and gives us both their User object and their chat-specific status.
+        member = await bot.get_chat_member(current_chat_id, user_id)
+        user = member.user
+
+        # --- Step 2: Assemble the result dictionary ---
+        result = {
+            "status": "success",
+            "user_profile": {
+                "id": user.id,
+                "full_name": user.full_name,
+                "first_name": user.first_name,
+                "last_name": user.last_name or "N/A",
+                "username": f"@{user.username}" if user.username else "N/A",
+                "is_bot": user.is_bot,
+                "is_premium": user.is_premium or False,
+                "language_code": user.language_code or "N/A"
+            },
+            "chat_specific_info": {
+                "status": member.status,
+            }
+        }
+
+        # --- Step 3: Add context-specific details based on status ---
+        chat_info = result["chat_specific_info"]
+        
+        if isinstance(member, (telegram.ChatMemberRestricted, telegram.ChatMemberBanned)):
+            # If user is muted or banned, show until when
+            if member.until_date:
+                chat_info["restricted_until_utc"] = member.until_date.isoformat()
+            else:
+                chat_info["restricted_until_utc"] = "Permanent"
+            # You can also add the specific permissions they are denied
+            chat_info["permissions_denied"] = {
+                "can_send_messages": member.can_send_messages,
+                "can_send_media_messages": member.can_send_media_messages,
+                "can_send_other_messages": member.can_send_other_messages,
+                "can_add_web_page_previews": member.can_add_web_page_previews,
+            }
+
+        elif isinstance(member, telegram.ChatMemberAdministrator):
+            chat_info["custom_title"] = member.custom_title or "N/A"
+            chat_info["admin_permissions"] = {
+                "can_manage_chat": member.can_manage_chat,
+                "can_delete_messages": member.can_delete_messages,
+                "can_manage_video_chats": member.can_manage_video_chats,
+                "can_restrict_members": member.can_restrict_members,
+                "can_promote_members": member.can_promote_members,
+                "can_change_info": member.can_change_info,
+                "can_invite_users": member.can_invite_users,
+                "can_post_messages": member.can_post_messages,
+                "can_edit_messages": member.can_edit_messages,
+                "can_pin_messages": member.can_pin_messages,
+                "can_manage_topics": member.can_manage_topics,
+            }
+        
+        elif isinstance(member, telegram.ChatMemberOwner):
+            chat_info["custom_title"] = member.custom_title or "N/A"
+            chat_info["admin_permissions"] = "All (Owner)"
+
+        # --- Step 4: Optionally fetch profile photos ---
+        if fetch_profile_photos:
+            try:
+                profile_photos = await bot.get_user_profile_photos(user_id, limit=3) # Limit to 3 to keep response size sane
+                result["user_profile"]["profile_photos"] = {
+                    "total_count": profile_photos.total_count,
+                    "fetched_photos": [
+                        {
+                            "file_id": p[-1].file_id, # Get the file_id of the largest photo
+                            "file_unique_id": p[-1].file_unique_id,
+                            "width": p[-1].width,
+                            "height": p[-1].height
+                        } for p in profile_photos.photos
+                    ]
+                }
+            except Exception as e:
+                logger.warning(f"Could not fetch profile photos for user {user_id}: {e}")
+                result["user_profile"]["profile_photos"] = {"error": "Could not fetch profile photos."}
+
+        return json.dumps(result, indent=2)
+
+    except telegram.error.BadRequest as e:
+        if "user not found" in e.message.lower():
+            return json.dumps({"status": "not_found", "error": "User with the specified ID was not found in this chat."})
+        return json.dumps({"status": "failed", "error": f"Telegram API error: {e.message}"})
+    except Exception as e:
+        logger.error(f"Unexpected error in comprehensive get_user_info_tool: {e}", exc_info=True)
+        return json.dumps({"error": "An unexpected internal error occurred."})
+
 AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
     "calculator": calculator_tool,
     "get_weather": get_weather_tool,
-    "web_search": web_search,
+    "web_search": web_search_tool,
     "create_poll_in_chat": create_poll_tool,
+    "get_game_deals": get_game_deals_tool,
+    "restrict_user_in_chat": restrict_user_in_chat_tool,
+    "get_user_info": get_user_info_tool,
 }
+
 TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": "Evaluates a mathematical expression. Supports +, -, *, /, ** (exponentiation), and parentheses.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "The mathematical expression to evaluate (e.g., '2+2', '(5*8-3)/2', '2^10')."
-                    }
-                },
-                "required": ["expression"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather data for a location with flexible timeframes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "The city and country, e.g., London, UK or a specific address."
-                    },
-                    "timeframe": {
-                        "type": "string",
-                        "enum": ['current', 'hourly', 'daily'],
-                        "default": 'current',
-                        "description": "Time resolution of the forecast: 'current' for current conditions, 'hourly' for hour-by-hour, 'daily' for day summaries."
-                    },
-                    "hours_ahead": {
-                        "type": "number",
-                        "description": "Optional. For 'hourly' timeframe, specifies the number of hours from now for which to get a single forecast point (e.g., 0 for current hour, 1 for next hour). Max 167."
-                    },
-                    "forecast_days": {
-                        "type": "number",
-                        "minimum": 1,
-                        "maximum": 14,
-                        "default": 1,
-                        "description": "Number of days to forecast (for daily or hourly if hours_ahead is not specified). E.g., 1 for today, 7 for a week."
-                    },
-                    "unit": {
-                        "type": "string",
-                        "enum": ['celsius', 'fahrenheit'],
-                        "default": 'celsius',
-                        "description": "Temperature unit."
-                    }
-                },
-                "required": ["location"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web/online/on the internet for information on a given topic. Fetches only the first page of search results from DuckDuckGo. Use when you require information you are unsure or unaware of.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query, e.g., 'What is the capital of France?'"
-                    },
-                    "site": {
-                        "type": "string",
-                        "description": "Optional. Limit search to a specific website (e.g., 'wikipedia.org') or use a DuckDuckGo bang (e.g., '!w' for Wikipedia). This is passed to DuckDuckGo's 'b' (bang) parameter. Leave empty for general search."
-                    },
-                    "region": {
-                        "type": "string",
-                        "description": "Optional. Limit search to results from a specific region/language (e.g., 'us-en' for US English, 'de-de' for Germany German). This is a DuckDuckGo region code passed to 'kl' parameter. Leave empty for global results."
-                    },
-                    "date_filter": {
-                        "type": "string",
-                        "description": "Optional. Filter search results by date: 'd' (past day), 'w' (past week), 'm' (past month), 'y' (past year). Passed to DuckDuckGo's 'df' parameter. Leave empty for no date filter.",
-                        "enum": ['', 'd', 'w', 'm', 'y']
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_poll_in_chat",
-            "description": "Creates a new poll in the current Telegram chat. This is useful for asking questions with multiple choice answers to the group or user.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "The question for the poll. Max 300 characters."
-                    },
-                    "options": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 2,
-                        "maxItems": 10,
-                        "description": "A list of 2 to 10 answer options for the poll. Each option max 100 characters."
-                    },
-                    "is_anonymous": {
-                        "type": "boolean",
-                        "default": True,
-                        "description": "Optional. If true, the poll is anonymous. Defaults to true."
-                    },
-                    "allows_multiple_answers": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Optional. If true, users can select multiple answers. Defaults to false."
-                    }
-                },
-                "required": ["question", "options"]
-            }
-        }
-    }
+   {
+      "type":"function",
+      "function":{
+         "name":"calculator",
+         "description":"Evaluates a mathematical expression. Supports +, -, *, /, ** (exponentiation), and parentheses.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "expression":{
+                  "type":"string",
+                  "description":"The mathematical expression to evaluate (e.g., '2+2', '(5*8-3)/2', '2^10')."
+               }
+            },
+            "required":[
+               "expression"
+            ]
+         }
+      }
+   },
+   {
+      "type":"function",
+      "function":{
+         "name":"get_weather",
+         "description":"Get weather data for a location with flexible timeframes.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "location":{
+                  "type":"string",
+                  "description":"The city and country, e.g., London, UK or a specific address."
+               },
+               "timeframe":{
+                  "type":"string",
+                  "enum":[
+                     "current",
+                     "hourly",
+                     "daily"
+                  ],
+                  "default":"current",
+                  "description":"Time resolution of the forecast: 'current' for current conditions, 'hourly' for hour-by-hour, 'daily' for day summaries."
+               },
+               "hours_ahead":{
+                  "type":"number",
+                  "description":"Optional. For 'hourly' timeframe, specifies the number of hours from now for which to get a single forecast point (e.g., 0 for current hour, 1 for next hour). Max 167."
+               },
+               "forecast_days":{
+                  "type":"number",
+                  "minimum":1,
+                  "maximum":14,
+                  "default":1,
+                  "description":"Number of days to forecast (for daily or hourly if hours_ahead is not specified). E.g., 1 for today, 7 for a week."
+               },
+               "unit":{
+                  "type":"string",
+                  "enum":[
+                     "celsius",
+                     "fahrenheit"
+                  ],
+                  "default":"celsius",
+                  "description":"Temperature unit."
+               }
+            },
+            "required":[
+               "location"
+            ]
+         }
+      }
+   },
+   {
+      "type":"function",
+      "function":{
+         "name":"web_search",
+         "description":"Search the web/online/on the internet for information on a given topic. Fetches only the first page of search results from DuckDuckGo. Use when you require information you are unsure or unaware of.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "query":{
+                  "type":"string",
+                  "description":"The search query, e.g., 'What is the capital of France?'"
+               },
+               "site":{
+                  "type":"string",
+                  "description":"Optional. Limit search to a specific website (e.g., 'wikipedia.org') or use a DuckDuckGo bang (e.g., '!w' for Wikipedia). This is passed to DuckDuckGo's 'b' (bang) parameter. Leave empty for general search."
+               },
+               "region":{
+                  "type":"string",
+                  "description":"Optional. Limit search to results from a specific region/language (e.g., 'us-en' for US English, 'de-de' for Germany German). This is a DuckDuckGo region code passed to 'kl' parameter. Leave empty for global results."
+               },
+               "date_filter":{
+                  "type":"string",
+                  "description":"Optional. Filter search results by date: 'd' (past day), 'w' (past week), 'm' (past month), 'y' (past year). Passed to DuckDuckGo's 'df' parameter. Leave empty for no date filter.",
+                  "enum":[
+                     "",
+                     "d",
+                     "w",
+                     "m",
+                     "y"
+                  ]
+               }
+            },
+            "required":[
+               "query"
+            ]
+         }
+      }
+   },
+   {
+      "type":"function",
+      "function":{
+         "name":"create_poll_in_chat",
+         "description":"Creates a new poll in the current Telegram chat. This is useful for asking questions with multiple choice answers to the group or user.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "question":{
+                  "type":"string",
+                  "description":"The question for the poll. Max 300 characters."
+               },
+               "options":{
+                  "type":"array",
+                  "items":{
+                     "type":"string"
+                  },
+                  "minItems":2,
+                  "maxItems":10,
+                  "description":"A list of 2 to 10 answer options for the poll. Each option max 100 characters."
+               },
+               "is_anonymous":{
+                  "type":"boolean",
+                  "default":True,
+                  "description":"Optional. If true, the poll is anonymous. Defaults to true."
+               },
+               "allows_multiple_answers":{
+                  "type":"boolean",
+                  "default":False,
+                  "description":"Optional. If true, users can select multiple answers. Defaults to false."
+               }
+            },
+            "required":[
+               "question",
+               "options"
+            ]
+         }
+      }
+   },
+   {
+      "type":"function",
+      "function":{
+         "name":"get_game_deals",
+         "description":"Fetches information about free game giveaways. Can fetch a list of deals, a single deal by ID, or the total worth of all active deals.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "deal_id":{
+                  "type":"integer",
+                  "description":"The unique ID of a specific giveaway to fetch details for."
+               },
+               "fetch_worth":{
+                  "type":"boolean",
+                  "description":"Set to true to get the total number and estimated USD value of all active giveaways instead of a list."
+               },
+               "platform":{
+                  "type":"string",
+                  "description":"The platform to filter giveaways for. e.g., 'pc', 'steam', 'epic-games-store'.",
+                  "enum":[
+                     "pc",
+                     "steam",
+                     "epic-games-store",
+                     "ubisoft",
+                     "gog",
+                     "itchio",
+                     "ps4",
+                     "ps5",
+                     "xbox-one",
+                     "xbox-series-xs",
+                     "switch",
+                     "android",
+                     "ios",
+                     "vr",
+                     "battlenet",
+                     "origin",
+                     "drm-free",
+                     "xbox-360"
+                  ]
+               },
+               "type":{
+                  "type":"string",
+                  "description":"The type of giveaway to filter for.",
+                  "enum":[
+                     "game",
+                     "loot",
+                     "beta"
+                  ]
+               },
+               "sort_by":{
+                  "type":"string",
+                  "description":"How to sort the results when fetching a list.",
+                  "enum":[
+                     "date",
+                     "value",
+                     "popularity"
+                  ]
+               }
+            },
+            "required":[
+               
+            ]
+         }
+      }
+   },
+   {
+      "type":"function",
+      "function":{
+         "name":"restrict_user_in_chat",
+         "description":"Temporarily mutes a user in the telegram chat, preventing them from sending messages. Requires the user's telegram ID. You must be an admin with permission to restrict members. Do not abuse this, keep mute durations low unless the offense truly warrants more.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "user_id":{
+                  "type":"integer",
+                  "description":"The unique integer ID of the user to mute. You can get this from a user's context or the get_user_info tool."
+               },
+               "duration":{
+                  "type":"string",
+                  "description":"The duration for the mute. Examples: '30m' for 30 minutes, '2h' for 2 hours, '1d' for 1 day. If not provided, defaults to 1 hour."
+               },
+               "reason":{
+                  "type":"string",
+                  "description":"Optional. The reason for the restriction, which will be logged."
+               }
+            },
+            "required":[
+               "user_id"
+            ]
+         }
+      }
+   },
+   {
+      "type":"function",
+      "function":{
+         "name":"get_user_info",
+         "description":"Retrieves comprehensive information about a user, including their global profile, chat-specific status (like admin rights or restrictions), and optionally their profile pictures.",
+         "parameters":{
+            "type":"object",
+            "properties":{
+               "user_id":{
+                  "type":"integer",
+                  "description":"The unique integer ID of the user to look up. You can get this from a user's context."
+               },
+               "fetch_profile_photos":{
+                  "type":"boolean",
+                  "default":False,
+                  "description":"Set to true to also fetch the user's profile pictures. This is an extra step and may not always be necessary."
+               }
+            },
+            "required":[
+               "user_id"
+            ]
+         }
+      }
+   }
 ]
 # --- END OF TOOL DEFINITIONS ---
 
@@ -1015,7 +1500,8 @@ def format_freewill_context_from_raw_log(
     num_messages_to_include: int,
     bot_name: str,
     current_chat_title: Optional[str],
-    current_topic_name_if_known: Optional[str] 
+    current_topic_name_if_known: Optional[str],
+    replied_to_message_context: Optional[Dict[str, str]] = None
 ) -> str:
     # Build a descriptive location string
     location_description_parts = []
@@ -1124,10 +1610,16 @@ def format_freewill_context_from_raw_log(
             if len(triggering_message_text) > 4096: 
                 triggering_message_text = triggering_message_text[:4096].strip() + "..."
     
-    # Include the topic description in the final prompt
+    # Construct and add the reply context to the final prompt
+    reply_context_addon = ""
+    if replied_to_message_context:
+        replied_author = replied_to_message_context.get("author", "someone")
+        replied_content = replied_to_message_context.get("content", "[their message]")
+        reply_context_addon = f" (in reply to '{replied_author}' who said: \"{replied_content}\")"
+    
     formatted_context_parts.append(
         f"\n[You are '{bot_name}', chatting on Telegram in {topic_desc_log}. Based on the excerpt above, where '{triggering_user_name}' "
-        f"just said: \"{triggering_message_text}\", "
+        f"just said: \"{triggering_message_text}\"{reply_context_addon}, "
         "make a relevant and in character interjection or comment. Be concise and natural.]"
     )
     return "\n".join(formatted_context_parts) + "\n\n"
@@ -1489,7 +1981,7 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_text = f"✅ Activated! I will now respond to all messages in {topic_desc}."
         logger.info(f"Bot activated for chat {chat_id} ({topic_desc}) by user {update.effective_user.id}")
     
-    await update.message.reply_text(reply_text) # reply_text handles thread_id
+    await update.message.reply_text(reply_text)
 
 async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user: return
@@ -1521,7 +2013,7 @@ async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         reply_text = f"I was not actively listening to all messages in {topic_desc} anyway."
         
-    await update.message.reply_text(reply_text) # reply_text handles thread_id
+    await update.message.reply_text(reply_text)
 # --- END OF COMMAND HANDLERS ---
 
 # --- Main Message Handler ---
@@ -1636,6 +2128,15 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
     # --- END MODIFICATION ---
 
     if is_free_will_triggered:
+        # Capture reply context specifically for free will
+        replied_to_info_for_freewill: Optional[Dict[str, str]] = None
+        if update.message.reply_to_message:
+            replied_msg = update.message.reply_to_message
+            author = get_display_name(replied_msg.from_user)
+            content = replied_msg.text or replied_msg.caption or "[Media or other non-text content]"
+            replied_to_info_for_freewill = {"author": author, "content": content}
+            logger.info(f"Free Will trigger is a reply to '{author}'. Adding context.")
+        
         # Generate context prompt based on raw log for the specific thread
         free_will_prompt = format_freewill_context_from_raw_log(
             chat_id,
@@ -1643,8 +2144,8 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             GROUP_FREE_WILL_CONTEXT_MESSAGES,
             context.bot.username or SHAPESINC_SHAPE_USERNAME,
             update.effective_chat.title, # Pass current chat title
-            known_topic_name_for_context # Pass known topic name resolved above
-
+            known_topic_name_for_context, # Pass known topic name resolved above
+            replied_to_message_context=replied_to_info_for_freewill
         )
         if free_will_prompt.strip():
              user_content_parts_for_llm.append({"type": "text", "text": free_will_prompt})
@@ -1989,46 +2490,52 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
         log_content_summary = f"Content (multi-part): {part_summaries}"
     logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Appended user message to LLM history. {log_content_summary}. Processed due to: reply_to_bot={is_direct_reply_to_bot}, mention={is_mention_to_bot}, free_will={is_free_will_triggered}, DM={chat_type==Chat.PRIVATE}, activated={is_activated_chat_topic}")
 
-    # --- Call the LLM API and Handle Response ---
-    typing_task: Optional[asyncio.Task] = None
-    initial_action = ChatAction.TYPING # Default action
-    
-    # Send initial chat action respecting thread ID, with fallback and timeout handling
-    effective_thread_id_for_action = current_message_thread_id
-    try:
-        await context.bot.send_chat_action(chat_id, initial_action, message_thread_id=effective_thread_id_for_action)
-    except telegram.error.BadRequest as e_action:
-        if "message thread not found" in e_action.message.lower() and effective_thread_id_for_action is not None:
-            logger.warning(f"Chat {chat_id}: Thread {effective_thread_id_for_action} not found for initial chat action. Attempting general chat.")
-            effective_thread_id_for_action = None # Fallback to general for typing loop
-            try:
-                await context.bot.send_chat_action(chat_id, initial_action, message_thread_id=None)
-            except Exception as e_action_general:
-                logger.error(f"Chat {chat_id}: Failed to send initial chat action to general after thread failure: {e_action_general}")
-                # typing_task will remain None
-        else:
-            logger.error(f"Chat {chat_id} (thread {effective_thread_id_for_action}): Failed to send initial chat action: {e_action}")
-            # typing_task will remain None
-    except (telegram.error.TimedOut, httpx.TimeoutException) as e_timeout_action:
-        logger.error(f"Chat {chat_id} (thread {effective_thread_id_for_action}): Timeout sending initial chat action: {e_timeout_action}")
-        # typing_task will remain None
-    except Exception as e_generic_action:
-        logger.error(f"Chat {chat_id} (thread {effective_thread_id_for_action}): Generic error sending initial chat action: {e_generic_action}")
-        # typing_task will remain None
-    else: # If initial send_chat_action was successful
-        typing_task = asyncio.create_task(_keep_typing_loop(context, chat_id, effective_thread_id_for_action, action=initial_action))
-
-
     MAX_TOOL_ITERATIONS, current_iteration = 5, 0
+    typing_task: Optional[asyncio.Task] = None
     tool_status_msg: Optional[TelegramMessage] = None
-    final_text_to_send_to_user = "I encountered an issue and couldn't generate a response. Please try again."
-    escaped_text_for_splitting = ""
+    final_text_from_llm_before_media_extraction = "I encountered an issue and couldn't generate a response. Please try again."
+    escaped_text_for_splitting = "" # Will hold the text part after media extraction
+
+
+    # --- START: Robust Thread ID Correction and Initial Indicator ---
+    effective_send_thread_id = current_message_thread_id
+    if (
+        update.effective_chat.is_forum
+        and update.message.reply_to_message
+        and update.message.reply_to_message.message_thread_id is None
+    ):
+        if effective_send_thread_id is not None:
+            logger.warning(
+                f"Correcting invalid thread ID {effective_send_thread_id} for a reply in the General forum topic. Setting to None."
+            )
+            effective_send_thread_id = None
+
+    # Start a generic "typing" indicator immediately.
+    # It will run during the AI call. We may switch it later if media is detected.
+    typing_task = asyncio.create_task(
+        _keep_typing_loop(context, chat_id, effective_send_thread_id, action=ChatAction.TYPING)
+    )
+    # --- END: Robust Thread ID Correction and Initial Indicator ---
 
     try:
         ai_msg_obj: Optional[ChatCompletionMessage] = None
         while current_iteration < MAX_TOOL_ITERATIONS:
             current_iteration += 1
             messages_for_this_api_call = list(llm_history) # Use a copy for the API call
+
+            # Define the Gemini-specific safety settings.
+            #gemini_safety_settings = [
+            #    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            #    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            #    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            #    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            #]
+            
+            # Put the custom Gemini parameters into the `extra_body` dictionary.
+            #extra_body_params = {
+            #    "safety_settings": gemini_safety_settings
+            #}
+
             # Prepare API parameters
             api_params: Dict[str, Any] = {
                 "model": f"shapesinc/{SHAPESINC_SHAPE_USERNAME}",
@@ -2094,7 +2601,6 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                 raw_sample_str = [str(m)[:150] for m in api_params["messages"][-2:]] 
                 messages_log_str = f"Error in detailed message logging: {log_e_inner}. Raw sample: {raw_sample_str}"
 
-
             # Add custom headers for API call
             custom_headers_for_api = {
                 "X-User-Id": str(current_user.id),
@@ -2103,7 +2609,6 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             # Include thread ID in headers if present
             if current_message_thread_id is not None: 
                  custom_headers_for_api["X-Thread-Id"] = str(current_message_thread_id)
-
 
             logger.info(
                 f"API Call (iter {current_iteration}/{MAX_TOOL_ITERATIONS}, FreeWill={is_free_will_triggered}) to {api_params['model']} for chat {chat_id} (thread {current_message_thread_id}). "
@@ -2115,11 +2620,13 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             # Execute the API call
             response_from_ai = await aclient_shape.chat.completions.create(
                 model=api_params["model"],
-                messages=api_params["messages"], 
-                tools=api_params.get("tools"), 
-                tool_choice=api_params.get("tool_choice"), 
+                messages=api_params["messages"],
+                tools=api_params.get("tools"),
+                tool_choice=api_params.get("tool_choice"),
+                #extra_body=extra_body_params,
                 extra_headers=custom_headers_for_api
             )
+
             ai_msg_obj = response_from_ai.choices[0].message
             # Append AI's response (potentially including tool calls) to history
             llm_history.append(ai_msg_obj.model_dump(exclude_none=True)) 
@@ -2130,14 +2637,13 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                 # Check if tools are actually enabled globally
                 if not ENABLE_TOOL_USE: 
                     logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI attempted tool use, but ENABLE_TOOL_USE is false. Tool calls: {ai_msg_obj.tool_calls}")
-                    final_text_to_send_to_user = "I tried to use a special tool, but it's currently disabled. Please ask in a different way."
-                    llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} # Overwrite tool call message
+                    final_text_from_llm_before_media_extraction = "I tried to use a special tool, but it's currently disabled. Please ask in a different way."
+                    llm_history[-1] = {"role": "assistant", "content": final_text_from_llm_before_media_extraction} # Overwrite tool call message
                     break # Exit tool loop
-                # Check if tools should be disabled for this specific call (free will)
-                if is_free_will_triggered:
+                if is_free_will_triggered: # Check if tools should be disabled for this specific call (free will)
                     logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI attempted tool use during free will, but tools are disabled for free will. Ignoring tool call.")
-                    final_text_to_send_to_user = ai_msg_obj.content or "I had a thought but it involved a tool I can't use for spontaneous comments. Never mind!"
-                    llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} # Overwrite tool call
+                    final_text_from_llm_before_media_extraction = ai_msg_obj.content or "I had a thought but it involved a tool I can't use for spontaneous comments. Never mind!"
+                    llm_history[-1] = {"role": "assistant", "content": final_text_from_llm_before_media_extraction} # Overwrite tool call
                     break # Exit tool loop
 
                 # Send a "using tools" status message if not already sent
@@ -2174,10 +2680,14 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                             
                             # Inject necessary context for specific tools
                             kwargs_for_tool = parsed_args.copy()
-                            if func_name == "create_poll_in_chat": 
+                            if func_name == "create_poll_in_chat":
                                 kwargs_for_tool["telegram_bot_context"] = context
                                 kwargs_for_tool["current_chat_id"] = chat_id
-                                kwargs_for_tool["current_message_thread_id"] = current_message_thread_id 
+                                kwargs_for_tool["current_message_thread_id"] = current_message_thread_id
+
+                            elif func_name in ["restrict_user_in_chat", "get_user_info"]:
+                                kwargs_for_tool["telegram_bot_context"] = context
+                                kwargs_for_tool["current_chat_id"] = chat_id
                             # Add similar blocks if other tools need context in the future
                             
                             # Execute the tool function (async or sync)
@@ -2204,30 +2714,28 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
                 llm_history.extend(tool_results_for_history)
                 logger.debug(f"Chat {chat_id} (thread {current_message_thread_id}): Extended LLM history with {len(tool_results_for_history)} tool results.")
                 # Loop continues for the next API call with tool results provided
-
             # --- Handle Final Text Response ---
-            elif ai_msg_obj.content is not None: 
+            elif ai_msg_obj.content is not None:
                 # If the AI provided text content directly, this is the final answer
-                final_text_to_send_to_user = str(ai_msg_obj.content)
-                logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): AI final text response (iter {current_iteration}): '{final_text_to_send_to_user[:120].replace(chr(10), ' ')}...'")
+                final_text_from_llm_before_media_extraction = str(ai_msg_obj.content)
+                logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): AI final text response (iter {current_iteration}): '{final_text_from_llm_before_media_extraction[:120].replace(chr(10), ' ')}...'")
                 break # Exit the tool loop, we have the final response
-            
             # --- Handle Empty/Unusual Response ---
-            else: 
+            else:
                 # If the AI response has neither tool calls nor content
                 logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): AI response (iter {current_iteration}) had no tool_calls and content was None. Response: {ai_msg_obj.model_dump_json(indent=2)}")
-                final_text_to_send_to_user = "AI provided an empty or unusual response. Please try rephrasing."
-                llm_history[-1] = {"role": "assistant", "content": final_text_to_send_to_user} # Overwrite empty response
+                final_text_from_llm_before_media_extraction = "AI provided an empty or unusual response. Please try rephrasing."
+                llm_history[-1] = {"role": "assistant", "content": final_text_from_llm_before_media_extraction} # Overwrite empty response
                 break # Exit loop with error message
         
         # --- Handle Max Iterations Reached ---
         # If loop finished without a final text response (e.g., max tool calls)
         if current_iteration >= MAX_TOOL_ITERATIONS and not (ai_msg_obj and ai_msg_obj.content is not None):
             logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Max tool iterations ({MAX_TOOL_ITERATIONS}) reached without final content from AI.")
-            final_text_to_send_to_user = "I tried using my tools multiple times but couldn't get a final answer. Could you try rephrasing your request or ask in a different way?"
+            final_text_from_llm_before_media_extraction = "I tried using my tools multiple times but couldn't get a final answer. Could you try rephrasing your request or ask in a different way?"
             # Append this error message to history if it's not already the last assistant message
-            if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_to_send_to_user): 
-                 llm_history.append({"role": "assistant", "content": final_text_to_send_to_user}) 
+            if not (llm_history and llm_history[-1].get("role") == "assistant" and llm_history[-1].get("content") == final_text_from_llm_before_media_extraction): 
+                 llm_history.append({"role": "assistant", "content": final_text_from_llm_before_media_extraction}) 
 
         # --- Clean up Status Messages ---
         # Delete the "using tools" status message if it was sent
@@ -2235,134 +2743,170 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             try: await tool_status_msg.delete()
             except Exception as e_del: logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Could not delete tool status msg ID {tool_status_msg.message_id}: {e_del}")
 
-        # --- Prepare Final Text for Sending ---
-        # Ensure final text is not empty or just whitespace
-        if not final_text_to_send_to_user.strip():
-            logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Final AI text to send was empty or whitespace. Defaulting to error message.")
-            final_text_to_send_to_user = "I'm sorry, I couldn't generate a valid response for that. Please try again."
-            # Update history if last message was empty assistant content
-            if llm_history and llm_history[-1].get("role") == "assistant" and not llm_history[-1].get("content","").strip(): 
-                llm_history[-1]["content"] = final_text_to_send_to_user
+        # --- START OF MEDIA URL DETECTION (BEFORE TEXT SENDING) ---
+        image_urls_to_send: List[str] = []
+        audio_urls_to_send: List[str] = []
+        text_part_after_media_extraction = final_text_from_llm_before_media_extraction # Start with the full AI response
 
-        # Escape the final text for Telegram MarkdownV2
-        logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): RAW AI response for user: >>>{final_text_to_send_to_user[:200].replace(chr(10), '/N')}...<<<")
-        escaped_text_for_splitting = telegram_markdown_v2_escape(final_text_to_send_to_user)
-        logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): FULLY ESCAPED text for user: >>>{escaped_text_for_splitting[:200].replace(chr(10), '/N')}...<<<")
+        # Define regex patterns
+        image_url_pattern = re.compile(r"(https://files\.shapes\.inc/[\w.-]+\.(?:png|jpg|jpeg|gif|webp))\b", re.IGNORECASE)
+        audio_url_pattern = re.compile(r"(https://files\.shapes\.inc/[\w.-]+\.(?:mp3|ogg|wav|m4a|flac))\b", re.IGNORECASE)
 
-        # --- Stop Typing Indicator and Send Response ---
-        if typing_task and not typing_task.done(): typing_task.cancel(); typing_task = None
-        max_mdv2_len = 4096 # Telegram's max message length
-        send_thread_id = current_message_thread_id # Use the determined thread ID for sending
-
-        # Wrapper for sending a single message chunk with fallback logic
-        async def attempt_send_one_message_wrapper(
-            bot_obj: Bot,
-            chat_id_val: int,
-            text_content: str,
-            preferred_thread_id_val: Optional[int],
-            try_markdown: bool
-        ):
-            parse_mode_to_try = ParseMode.MARKDOWN_V2 if try_markdown else None
-            try:
-                # Use the helper function which handles thread-not-found fallback
-                await send_message_to_chat_or_general(
-                    bot_obj, chat_id_val, text_content,
-                    preferred_thread_id=preferred_thread_id_val,
-                    parse_mode=parse_mode_to_try
-                )
-                return True # Success
-            except telegram.error.BadRequest as e_send:
-                # This error occurs *after* the helper tried both preferred thread and general chat.
-                # It likely indicates a content issue (bad Markdown) or other permission problem.
-                logger.error(
-                    f"Chat {chat_id_val} (attempted thread {preferred_thread_id_val}, then general): "
-                    f"Send failed with {'MDv2' if try_markdown else 'Plain'}. Error: {e_send}. "
-                    f"Text snippet: '{text_content[:100]}'"
-                )
-                if try_markdown:
-                    return False # Indicate MD failure, outer logic should try plain
-                else: # Plain text also failed (after MD fallback, or was initial plain try)
-                    raise e_send # Re-raise, as even plain text send failed
-            except Exception as e_other_send_error:
-                 logger.error(f"Chat {chat_id_val}: Unexpected error during attempt_send_one_message_wrapper: {e_other_send_error}", exc_info=True)
-                 raise e_other_send_error
-
-        # --- Sending Logic: Single Message or Split ---
-        if len(escaped_text_for_splitting) <= max_mdv2_len:
-            # Try sending the single message with MarkdownV2
-            if not await attempt_send_one_message_wrapper(
-                context.bot, chat_id, escaped_text_for_splitting,
-                send_thread_id, try_markdown=True
-            ):
-                # MDv2 failed, try sending the original, unescaped plain text version
-                logger.info(f"Chat {chat_id} (thread {send_thread_id}): MDv2 failed for single message, falling back to plain text: {final_text_to_send_to_user[:100]}")
-                try:
-                    await attempt_send_one_message_wrapper(
-                        context.bot, chat_id, final_text_to_send_to_user, # Use original plain text
-                        send_thread_id, try_markdown=False
-                    )
-                except Exception as e_final_plain_send:
-                    # If plain text also fails (rare), log and send a final error message
-                    logger.error(f"Chat {chat_id} (thread {send_thread_id}): Final plain text send also failed: {e_final_plain_send}")
-                    await send_message_to_chat_or_general(
-                        context.bot, chat_id, "Error formatting and sending my response. (S_ULT_FAIL)",
-                        preferred_thread_id=send_thread_id
-                    )
-        else: # Text is too long, needs splitting
-            logger.info(f"Chat {chat_id} (thread {send_thread_id}): Escaped text too long ({len(escaped_text_for_splitting)}), using intelligent splitting.")
-            # Split the escaped text using the balancing splitter
-            message_parts_to_send = split_message_with_markdown_balancing(escaped_text_for_splitting, max_mdv2_len, logger)
+        all_media_matches_in_response: List[Dict[str, Any]] = []
+        for pattern, media_type_label in [(image_url_pattern, "image"), (audio_url_pattern, "audio")]:
+            for match_obj in pattern.finditer(text_part_after_media_extraction):
+                all_media_matches_in_response.append({
+                    "start": match_obj.start(), "end": match_obj.end(),
+                    "url": match_obj.group(0), "type": media_type_label
+                })
+        
+        all_media_matches_in_response.sort(key=lambda m: m["start"]) 
+        
+        plain_text_segments_after_extraction: List[str] = []
+        last_char_index_processed = 0
+        for media_item_match_info in all_media_matches_in_response:
+            if media_item_match_info["start"] > last_char_index_processed:
+                plain_text_segments_after_extraction.append(text_part_after_media_extraction[last_char_index_processed:media_item_match_info["start"]])
+            if media_item_match_info["type"] == "image": image_urls_to_send.append(media_item_match_info["url"])
+            elif media_item_match_info["type"] == "audio": audio_urls_to_send.append(media_item_match_info["url"])
+            last_char_index_processed = media_item_match_info["end"]
+        if last_char_index_processed < len(text_part_after_media_extraction):
+            plain_text_segments_after_extraction.append(text_part_after_media_extraction[last_char_index_processed:])
             
-            # Handle case where splitter returns nothing for non-empty text (should be rare)
-            if not message_parts_to_send and escaped_text_for_splitting.strip():
-                logger.warning(f"Chat {chat_id} (thread {send_thread_id}): Splitter returned no parts for non-empty text. Sending truncated.")
-                safe_truncate_len = 4096 - 150 # Leave room for truncation marker
-                trunc_txt = escaped_text_for_splitting[:safe_truncate_len] + "\n\\[MESSAGE_TRUNCATED_SPLIT_FAIL\\]"
-                message_parts_to_send.append(trunc_txt[:max_mdv2_len])
+        text_part_after_media_extraction = "".join(plain_text_segments_after_extraction)
+        
+        # <<< FIX #2: Clean up empty markdown link artifacts >>>
+        text_part_after_media_extraction = re.sub(r'\[([^\]]*)\]\(\s*\)', r'\1', text_part_after_media_extraction)
+        
+        text_part_after_media_extraction = re.sub(r'(\r\n|\r|\n){2,}', '\n', text_part_after_media_extraction).strip()
 
-            # Send each part
-            for i, part_chunk_md_escaped in enumerate(message_parts_to_send):
-                current_chunk_to_send = part_chunk_md_escaped.strip()
-                # Skip parts that are effectively empty after stripping (e.g., only whitespace or markdown delimiters)
-                if not current_chunk_to_send:
-                    temp_strip_styles = part_chunk_md_escaped
-                    for delim_s in _BALANCING_MARKDOWN_DELIMITERS: temp_strip_styles = temp_strip_styles.replace(delim_s, "")
-                    if not temp_strip_styles.strip(): 
-                        logger.info(f"Chat {chat_id} (thread {send_thread_id}): Skipping empty or style-only part {i+1} from splitter."); continue
-                
-                # Safety truncate if a split part is somehow still too long (should not happen with correct splitter)
-                if len(current_chunk_to_send) > max_mdv2_len: 
-                    safe_truncate_len = 4096 - 150 # Leave room for marker
-                    logger.warning(f"Chat {chat_id} (thread {send_thread_id}): Split part {i+1} still too long ({len(current_chunk_to_send)}). Truncating.")
-                    current_chunk_to_send = current_chunk_to_send[:safe_truncate_len] + "\n\\[MESSAGE_PART_TRUNCATED\\]"
-                    current_chunk_to_send = current_chunk_to_send[:max_mdv2_len] # Final enforcement
-                
-                logger.info(f"Chat {chat_id} (thread {send_thread_id}): Sending MDv2 part {i+1}/{len(message_parts_to_send)} (len: {len(current_chunk_to_send)}): '{current_chunk_to_send[:200].replace(chr(10),'/N')}...'")
-                # Try sending the MDv2 chunk
-                if not await attempt_send_one_message_wrapper(
-                    context.bot, chat_id, current_chunk_to_send,
-                    send_thread_id, try_markdown=True
-                ):
-                    # MDv2 chunk failed, try sending this *escaped* chunk as plain text
-                    # We send the escaped version because reversing the escape is complex and might lose intended formatting nuances.
-                    # Sending it as plain text preserves the content, even if the styling is lost.
-                    logger.info(f"Chat {chat_id} (thread {send_thread_id}): MDv2 failed for split part {i+1}, falling back to plain text for this part.")
+        if image_urls_to_send: logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Extracted image URLs: {image_urls_to_send}")
+        if audio_urls_to_send: logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Extracted audio URLs: {audio_urls_to_send}")
+        # --- END OF MEDIA URL DETECTION ---
+
+        # --- INDICATOR SWITCH ---
+        # If the AI response contains media, cancel the "typing" indicator
+        # and start the appropriate "uploading" indicator.
+        if image_urls_to_send or audio_urls_to_send:
+            if typing_task and not typing_task.done():
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass # This is expected
+
+            action_for_media = ChatAction.UPLOAD_PHOTO if image_urls_to_send else ChatAction.UPLOAD_VOICE
+            logger.info(f"Switching to media indicator: {action_for_media}")
+
+            # Send the action ONCE explicitly *before* starting the loop.
+            # This guarantees the indicator appears, defeating the race condition.
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action=action_for_media, message_thread_id=effective_send_thread_id)
+            except Exception as e:
+                logger.warning(f"Could not send initial media chat action '{action_for_media}': {e}")
+            
+            # Now, create the new background task to KEEP the indicator alive while we send.
+            typing_task = asyncio.create_task(
+                _keep_typing_loop(context, chat_id, effective_send_thread_id, action=action_for_media)
+            )
+        # --- END: INDICATOR SWITCH ---
+
+        # Ensure final text is not empty or just whitespace IF IT'S THE ONLY THING
+        if not text_part_after_media_extraction.strip() and not (image_urls_to_send or audio_urls_to_send):
+            logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Final AI text was empty or whitespace (and no media extracted). Defaulting to error message.")
+            text_part_after_media_extraction = "I'm sorry, I couldn't generate a valid response for that. Please try again."
+            # Update history if last message was empty assistant content and we are overriding it
+            if llm_history and llm_history[-1].get("role") == "assistant" and not llm_history[-1].get("content","").strip(): 
+                llm_history[-1]["content"] = text_part_after_media_extraction
+        
+        # Prepare for sending the remaining text part, if any
+        if text_part_after_media_extraction.strip():
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): Text part for user (before media sending): >>>{text_part_after_media_extraction[:200].replace(chr(10), '/N')}...<<<")
+            escaped_text_for_splitting = telegram_markdown_v2_escape(text_part_after_media_extraction)
+            logger.info(f"Chat {chat_id} (thread {current_message_thread_id}): FULLY ESCAPED text part for user: >>>{escaped_text_for_splitting[:200].replace(chr(10), '/N')}...<<<")
+        else:
+            escaped_text_for_splitting = "" # No text to send
+        
+        if escaped_text_for_splitting.strip():
+            max_mdv2_len = 4096 
+            send_thread_id = current_message_thread_id # Use the determined thread ID for sending
+            
+            # Wrapper for sending a single message chunk with fallback logic
+            async def attempt_send_one_message_wrapper(
+                bot_obj: Bot, chat_id_val: int, text_content: str,
+                preferred_thread_id_val: Optional[int], try_markdown: bool
+            ):
+                parse_mode_to_try = ParseMode.MARKDOWN_V2 if try_markdown else None
+                try:
+                    await send_message_to_chat_or_general(bot_obj, chat_id_val, text_content, preferred_thread_id=preferred_thread_id_val, parse_mode=parse_mode_to_try)
+                    return True 
+                except telegram.error.BadRequest as e_send:
+                    logger.error(f"Chat {chat_id_val} (attempted thread {preferred_thread_id_val}, then general): Send failed with {'MDv2' if try_markdown else 'Plain'}. Error: {e_send}. Text snippet: '{text_content[:100]}'")
+                    if try_markdown: return False 
+                    else: raise e_send 
+                except Exception as e_other_send_error:
+                    logger.error(f"Chat {chat_id_val}: Unexpected error during attempt_send_one_message_wrapper: {e_other_send_error}", exc_info=True)
+                    raise e_other_send_error
+
+            if len(escaped_text_for_splitting) <= max_mdv2_len: 
+                if not await attempt_send_one_message_wrapper(context.bot, chat_id, escaped_text_for_splitting, send_thread_id, try_markdown=True):
+                    logger.info(f"Chat {chat_id} (thread {send_thread_id}): MDv2 failed for single message, falling back to plain text: {text_part_after_media_extraction[:100]}")
                     try:
-                        await attempt_send_one_message_wrapper(
-                            context.bot, chat_id, current_chunk_to_send, # Send the escaped MD chunk as plain
-                            send_thread_id, try_markdown=False
-                        )
-                    except Exception as e_final_plain_chunk_send:
-                        logger.error(f"Chat {chat_id} (thread {send_thread_id}): Final plain text send for chunk {i+1} also failed: {e_final_plain_chunk_send}")
-                        # Send an error message for this specific chunk failure
-                        await send_message_to_chat_or_general(
-                            context.bot, chat_id, f"[Problem sending part {i+1} of my response. (C_ULT_FAIL)]",
-                            preferred_thread_id=send_thread_id
-                        )
-                # Small delay between sending parts
-                if i < len(message_parts_to_send) - 1:
-                    await asyncio.sleep(0.75) 
-        # --- END OF Sending Logic ---
+                        await attempt_send_one_message_wrapper(context.bot, chat_id, text_part_after_media_extraction, send_thread_id, try_markdown=False)
+                    except Exception as e_final_plain_send:
+                        logger.error(f"Chat {chat_id} (thread {send_thread_id}): Final plain text send also failed: {e_final_plain_send}")
+                        await send_message_to_chat_or_general(context.bot, chat_id, "Error formatting and sending my response. (S_ULT_FAIL)", preferred_thread_id=send_thread_id)
+            else: 
+                logger.info(f"Chat {chat_id} (thread {send_thread_id}): Escaped text too long ({len(escaped_text_for_splitting)}), using intelligent splitting.")
+                message_parts_to_send = split_message_with_markdown_balancing(escaped_text_for_splitting, max_mdv2_len, logger)
+                if not message_parts_to_send and escaped_text_for_splitting.strip(): 
+                    logger.warning(f"Chat {chat_id} (thread {send_thread_id}): Splitter returned no parts for non-empty text. Sending truncated.")
+                    safe_truncate_len = 4096 - 150 
+                    trunc_txt = escaped_text_for_splitting[:safe_truncate_len] + "\n\\[MESSAGE_TRUNCATED_SPLIT_FAIL\\]"
+                    message_parts_to_send.append(trunc_txt[:max_mdv2_len])
+                for i, part_chunk_md_escaped in enumerate(message_parts_to_send): 
+                    current_chunk_to_send = part_chunk_md_escaped.strip()
+                    if not current_chunk_to_send:
+                        temp_strip_styles = part_chunk_md_escaped
+                        for delim_s in _BALANCING_MARKDOWN_DELIMITERS: temp_strip_styles = temp_strip_styles.replace(delim_s, "")
+                        if not temp_strip_styles.strip(): 
+                            logger.info(f"Chat {chat_id} (thread {send_thread_id}): Skipping empty or style-only part {i+1} from splitter."); continue
+                    if len(current_chunk_to_send) > max_mdv2_len: 
+                        safe_truncate_len = 4096 - 150 
+                        logger.warning(f"Chat {chat_id} (thread {send_thread_id}): Split part {i+1} still too long ({len(current_chunk_to_send)}). Truncating.")
+                        current_chunk_to_send = current_chunk_to_send[:safe_truncate_len] + "\n\\[MESSAGE_PART_TRUNCATED\\]"
+                        current_chunk_to_send = current_chunk_to_send[:max_mdv2_len] 
+                    logger.info(f"Chat {chat_id} (thread {send_thread_id}): Sending MDv2 part {i+1}/{len(message_parts_to_send)} (len: {len(current_chunk_to_send)}): '{current_chunk_to_send[:200].replace(chr(10),'/N')}...'")
+                    if not await attempt_send_one_message_wrapper(context.bot, chat_id, current_chunk_to_send, send_thread_id, try_markdown=True):
+                        logger.info(f"Chat {chat_id} (thread {send_thread_id}): MDv2 failed for split part {i+1}, falling back to plain text for this part.")
+                        try:
+                            await attempt_send_one_message_wrapper(context.bot, chat_id, current_chunk_to_send, send_thread_id, try_markdown=False)
+                        except Exception as e_final_plain_chunk_send:
+                            logger.error(f"Chat {chat_id} (thread {send_thread_id}): Final plain text send for chunk {i+1} also failed: {e_final_plain_chunk_send}")
+                            await send_message_to_chat_or_general(context.bot, chat_id, f"[Problem sending part {i+1} of my response. (C_ULT_FAIL)]", preferred_thread_id=send_thread_id)
+                    if i < len(message_parts_to_send) - 1: await asyncio.sleep(0.75) 
+
+        # --- START OF MEDIA SENDING (MOVED TO AFTER TEXT SENDING) ---
+        # Send Images if any were extracted
+        if image_urls_to_send:
+            for img_url in image_urls_to_send:
+                logger.info(f"Chat {chat_id} (thread {effective_send_thread_id}): Sending image from URL: {img_url}")
+                try:
+                    await send_photo_to_chat_or_general(context.bot, chat_id, img_url, preferred_thread_id=effective_send_thread_id)
+                    await asyncio.sleep(0.5)
+                except Exception as e_send_img:
+                    logger.error(f"Chat {chat_id} (thread {effective_send_thread_id}): Failed to send image {img_url}. Error: {e_send_img}", exc_info=True)
+
+        # Send Audio files if any were extracted
+        if audio_urls_to_send:
+            for audio_url in audio_urls_to_send:
+                logger.info(f"Chat {chat_id} (thread {effective_send_thread_id}): Sending audio from URL: {audio_url}")
+                try:
+                    await send_audio_to_chat_or_general(context.bot, chat_id, audio_url, preferred_thread_id=effective_send_thread_id)
+                    await asyncio.sleep(0.5)
+                except Exception as e_send_audio:
+                    logger.error(f"Chat {chat_id} (thread {effective_send_thread_id}): Failed to send audio {audio_url}. Error: {e_send_audio}", exc_info=True)
+        # --- END OF MEDIA SENDING ---
 
     # --- Specific Exception Handling ---
     # Use imported InternalServerError and APITimeoutError directly from openai
@@ -2384,7 +2928,6 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             try:
                 await send_message_to_chat_or_general(context.bot, chat_id, final_text_to_send_to_user, preferred_thread_id=current_message_thread_id)
             except Exception as e_send_err: logger.error(f"Error sending ISE message: {e_send_err}")
-        # We don't re-raise here as we've handled it by informing the user.
 
     except APITimeoutError as e_openai_timeout:
         # Handle client-side timeout waiting for the API
@@ -2398,24 +2941,23 @@ async def process_message_entrypoint(update: Update, context: ContextTypes.DEFAU
             try:
                 await send_message_to_chat_or_general(context.bot, chat_id, final_text_to_send_to_user, preferred_thread_id=current_message_thread_id)
             except Exception as e_send_err: logger.error(f"Error sending Timeout message: {e_send_err}")
-        # We don't re-raise here as we've handled it by informing the user.
 
     # --- Telegram Specific Error Handling ---
     except telegram.error.BadRequest as e_outer_tg_badreq: 
         # This catch block is for BadRequest errors that might occur *outside* the robust sending logic 
         # (e.g., during initial chat action send, or if the sending logic itself had an issue causing a re-raise).
         # It can also catch errors if the final plain text fallback send fails within the logic above.
-        logger.error(f"Outer Telegram BadRequest for chat {chat_id} (thread {current_message_thread_id}): {e_outer_tg_badreq}. Raw AI response: '{final_text_to_send_to_user[:500]}'", exc_info=True)
+        logger.error(f"Outer Telegram BadRequest for chat {chat_id} (thread {current_message_thread_id}): {e_outer_tg_badreq}. Raw AI response: '{final_text_from_llm_before_media_extraction[:500]}'", exc_info=True)
         try: 
-            plain_fb_full_outer = final_text_to_send_to_user # Use the original AI response
+            plain_fb_full_outer = final_text_from_llm_before_media_extraction # Use the original AI response
             # Re-attempt sending the *entire* original message as plain text directly to general chat as a last resort.
-            if len(plain_fb_full_outer) <= max_mdv2_len: # Telegram's absolute max length
+            if len(plain_fb_full_outer) <= 4096: # Telegram's absolute max length
                 await context.bot.send_message(chat_id, text=plain_fb_full_outer, message_thread_id=None) # Try general explicitly
             else: 
                 # If even plain text is too long, split it for general chat
                 logger.warning(f"Chat {chat_id} (thread {current_message_thread_id}): Outer plain text fallback also too long ({len(plain_fb_full_outer)}), splitting for general.")
-                num_chunks_outer = (len(plain_fb_full_outer) + max_mdv2_len -1) // max_mdv2_len
-                for i, chunk in enumerate([plain_fb_full_outer[j:j+max_mdv2_len] for j in range(0, len(plain_fb_full_outer), max_mdv2_len)]):
+                num_chunks_outer = (len(plain_fb_full_outer) + 4096 -1) // 4096
+                for i, chunk in enumerate([plain_fb_full_outer[j:j+4096] for j in range(0, len(plain_fb_full_outer), 4096)]):
                     hdr = f"[Fallback Part {i+1}/{num_chunks_outer}]\n" if num_chunks_outer > 1 else ""
                     await context.bot.send_message(chat_id, text=hdr + chunk, message_thread_id=None) # Try general explicitly
                     if i < num_chunks_outer -1 : await asyncio.sleep(0.5) # Brief pause between chunks
@@ -2595,7 +3137,10 @@ if __name__ == "__main__":
     if IGNORE_OLD_MESSAGES_ON_STARTUP:
         logger.info("Bot will ignore messages received before this startup time.")
 
-    app_builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+    # Increase timeouts for network requests, especially for sending files
+    # Default is 5s, which is too short for uploads. We'll set a longer read/write timeout.
+    app_builder = ApplicationBuilder().token(TELEGRAM_TOKEN).connect_timeout(10.0).read_timeout(60.0).write_timeout(60.0) # Increased timeouts
+    
     app_builder.post_init(post_initialization) # Register post_init hook
     app = app_builder.build()
 
