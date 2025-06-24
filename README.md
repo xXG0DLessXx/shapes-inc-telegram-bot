@@ -4,53 +4,63 @@ This project is a Python-based Telegram bot that leverages the Shapes.inc platfo
 
 The bot can:
 *   Engage in text-based conversations.
-*   Understand and respond to images sent by users.
-*   Process voice messages sent by users.
-*   Utilize tools like a calculator, weather information, web search, and creating polls.
-*   Potentially generate images using Bing Image Creator (this feature is experimental and may not be fully functional).
+*   Understand and respond to images sent by users (as direct photos or document attachments).
+*   Process voice messages sent by users (as direct voice messages or document attachments).
+*   **Process text from uploaded documents:** Supports `.txt`, `.md`, `.docx`, and `.odt` files.
+*   Utilize tools like a calculator, weather information, web search, creating polls, fetching game deals, moderating users, getting user info, and generating anime-style images.
+*   Potentially generate images using Bing Image Creator (this feature remains experimental).
 *   **Support Telegram Group Topics:**
-    *   Maintain independent conversation histories per topic (and the general chat area) (THIS IS CURRENTLY NOT IMPLEMENTED BECAUSE SHAPES API DOES NOT USE THE OPENAI CONVERSATION HISTORY).
-    *   Operate its "free will" mode contextually within each topic.
+    *   Maintain independent conversation histories per topic (and the general chat area) if `SEPARATE_TOPIC_HISTORIES` is enabled. If disabled, all messages in a group share one history. Note: This separation is on the bot's side; Shapes.inc API might still manage its own broader context unless specific `X-Channel-Id` headers are respected by them for history scoping. The bot now sends a more granular `X-Channel-Id` header (e.g., `chatid_topicid` or `chatid_general`) which might help Shapes.inc scope context.
+    *   Operate its "free will" mode contextually within each topic/general area (based on `SEPARATE_TOPIC_HISTORIES` setting).
     *   Allow activation/deactivation for listening to all messages within a specific topic or the general group chat.
-    *   Target tools (like polls) to the specific topic where the command was issued.
+    *   Target tools (like polls or anime image generation) to the specific topic/chat where the command was issued.
+    *   Implement processing locks to handle messages sequentially within a given conversational context (chat-wide or topic-specific, depending on `SEPARATE_TOPIC_HISTORIES`).
 *   In group chats (including topics), it can operate in a "free will" mode, occasionally interjecting into conversations based on recent message context within that specific chat/topic.
 
-**Disclaimer:** This codebase is mostly the result of "vibe coding" and was developed rapidly, evolving from an older Poe.com Telegram bot. While new features like topic support have been added, it's functional but should be considered "quick and dirty." Significant cleanup, refactoring, and more robust error handling would be beneficial for production use. Some features, like the Bing Image generation, might be unreliable or broken.
+**Disclaimer:** This codebase is mostly the result of "vibe coding" and was developed rapidly, evolving from an older Poe.com Telegram bot. While new features like topic support and document processing have been added, it's functional but should be considered "quick and dirty." Significant cleanup, refactoring, and more robust error handling would be beneficial for production use. Some features, like the Bing Image generation, might be unreliable or broken.
 
 ## Features
 
 *   **Conversational AI:** Powered by Shapes.inc (via `openai` library targeting a custom base URL).
-*   **Multi-Modal Input:** Can process text, images, and voice messages.
+*   **Multi-Modal Input:** Can process text, images (direct or as documents), voice messages (direct or as documents), and text-based documents (`.txt`, `.md`, `.docx`, `.odt`).
 *   **Tool Usage (Function Calling):**
     *   `calculator`: Evaluates mathematical expressions.
     *   `get_weather`: Fetches current, hourly, or daily weather forecasts.
     *   `web_search`: Performs web searches using DuckDuckGo.
     *   `create_poll_in_chat`: Creates a poll in the current chat/topic.
+    *   `get_game_deals`: Fetches information about free game giveaways.
+    *   `restrict_user_in_chat`: Temporarily mutes a user in the chat.
+    *   `get_user_info`: Retrieves comprehensive information about a chat member.
+    *   `generate_anime_image`: Generates an anime-style image using Perchance API and sends it to the chat.
 *   **Image Generation (Experimental):** `/imagine` command using Bing Image Creator (requires `BING_AUTH_COOKIE`).
 *   **Telegram Group Topic Support:**
-    *   Independent conversation histories per topic (and general chat) (THIS DOES NOT WORK DUE TO HOW SHAPES API USES ITS OWN HISTORY).
-    *   Free will mode, `/newchat`, and tool usage are scoped to the current topic/general chat.
+    *   Configurable independent conversation histories per topic (and general chat) via `SEPARATE_TOPIC_HISTORIES`. If enabled, each topic (or the general area) has its own context. If disabled, the entire group shares one context. The bot sends a distinct `X-Channel-Id` header to Shapes.inc based on this setting, which may influence their server-side context management.
+    *   Free will mode, `/newchat`, and tool usage are scoped to the current topic/general chat, respecting `SEPARATE_TOPIC_HISTORIES`.
     *   `/activate`: Bot listens to all messages in the current topic/general chat.
     *   `/deactivate`: Bot stops listening to all messages, reverting to mentions/replies/free will.
     *   Caches topic names for better contextual understanding.
-*   **Group "Free Will" Mode:** Bot can spontaneously respond in group chats/topics based on configurable probability and message context specific to that chat/topic.
+    *   Introduced processing locks to ensure messages within the same conversational context (chat or topic-specific) are processed one at a time, preventing race conditions.
+*   **Group "Free Will" Mode:** Bot can spontaneously respond in group chats/topics based on configurable probability and message context specific to that chat/topic (respecting `SEPARATE_TOPIC_HISTORIES`).
 *   **User/Chat Whitelisting:** Restrict bot access to specific users or chats.
-*   **Conversation History Management:** `/newchat` command to clear context for the current chat/topic. (Note: This does not work because Shapes.inc manages context on their side. Standard Shape commands like `!wack` might be more relevant for resetting context directly on their platform).
+*   **Conversation History Management:** `/newchat` command clears the bot's side of the conversation history for the current chat/topic (respecting `SEPARATE_TOPIC_HISTORIES`). Note: This primarily affects the bot's local context. Shapes.inc manages its own context on their side; standard Shape commands like `!wack` might be more effective for a full reset on their platform. The `X-Channel-Id` header sent by the bot aims to help Shapes.inc scope its history.
 *   **MarkdownV2 Support:** Advanced message formatting with intelligent splitting for long messages.
 *   **Dockerized Deployment:** Easily run multiple bot instances with `docker-compose`.
-*   **Dynamic Configuration:** Most settings are managed via environment variables.
+*   **Dynamic Configuration:** Most settings are managed via environment variables, including `SEPARATE_TOPIC_HISTORIES`.
 *   **Ignore Old Messages (Optional):** Can be configured to ignore messages received before the bot started up.
 *   **Dynamic Bot Commands:** Bot commands list in Telegram UI is updated on startup based on available features.
+*   **Concurrent Update Processing:** Bot is configured to handle multiple updates concurrently (via `app_builder.concurrent_updates(True)`).
 
 ## Tech Stack
 
 *   **Python 3.11** (as per Dockerfile)
-*   **python-telegram-bot:** For Telegram Bot API interaction.
-*   **openai:** To interact with the Shapes.inc API.
-*   **python-dotenv:** For managing environment variables.
-*   **httpx:** For making HTTP requests (used by tools and OpenAI client).
-*   **pytz, beautifulsoup4:** Used by weather and web search tools.
-*   **BingImageCreator:** (Optional) For the `/imagine` command.
+*   **python-telegram-bot[ext]>=21.1.1,<22.0.0:** For Telegram Bot API interaction. (Note: `[ext]` installs extra dependencies like `httpx` automatically if not specified separately).
+*   **openai>=1.35.7,<2.0.0:** To interact with the Shapes.inc API.
+*   **python-dotenv>=1.0.1,<1.1.0:** For managing environment variables.
+*   **httpx[http2]>=0.27.0,<0.28.0:** For making HTTP requests (used by tools and OpenAI client).
+*   **pytz>=2024.1,<2025.0, beautifulsoup4>=4.12.3,<4.13.0:** Used by weather and web search tools.
+*   **BingImageCreator>=0.5.0,<0.6.0:** (Optional) For the `/imagine` command.
+*   **python-docx>=1.1.0,<2.0.0:** For reading `.docx` files.
+*   **odfpy>=1.4.1,<2.0.0:** For reading `.odt` files.
 *   **Docker & Docker Compose:** For containerization and multi-bot deployment.
 
 ## Prerequisites
@@ -62,6 +72,7 @@ The bot can:
 *   A Shapes.inc API Key.
 *   A Shapes.inc Shape Username/Vanity URL for each bot instance.
 *   (Optional) Bing Auth Cookie if you want to test/use the `/imagine` command.
+*   (Optional) `PERCHANCE_USER_KEY` if you want to use the `generate_anime_image` tool.
 
 ## Setup and Configuration
 
@@ -72,7 +83,7 @@ The bot is configured primarily through environment variables. The `docker-compo
 You'll need to create the following `.env` files in the project root:
 
 **a) `common.env` (for shared settings):**
-Create this file and populate it with settings common to all bot instances. See `env.example` for all possible variables.
+Create this file and populate it with settings common to all bot instances. See `example.env` for all possible variables.
 
 ```ini
 # common.env
@@ -90,11 +101,18 @@ GROUP_FREE_WILL_ENABLED=true
 GROUP_FREE_WILL_PROBABILITY=0.05 # 0.05 is 5%
 GROUP_FREE_WILL_CONTEXT_MESSAGES=5 # Number of recent messages within the topic/chat to consider
 
+# Optional: Sets whether each TOPIC/THREAD in a telegram group should be a separate chat history
+# Set to true for separate histories per topic, false for one history per group.
+SEPARATE_TOPIC_HISTORIES=true
+
 # Enable Tool Use
 ENABLE_TOOL_USE=true
 
 # Optional: Ignore messages older than bot startup time
 # IGNORE_OLD_MESSAGES_ON_STARTUP=false # Set to true to enable
+
+# Perchance user key for generate_anime_image tool
+# PERCHANCE_USER_KEY=your_perchance_user_key_here
 
 # Optional: Bing Image Creator Cookie (if you want to try /imagine)
 # BING_AUTH_COOKIE=your_bing_auth_cookie_here
@@ -119,7 +137,7 @@ SHAPESINC_SHAPE_USERNAME=discordaddictamy
 ```
 
 **Important:**
-*   Copy `env.example` to get a template for all variables.
+*   Copy `example.env` to get a template for all variables.
 *   The variables `BOT_TOKEN` and `SHAPESINC_SHAPE_USERNAME` are **required** in the bot-specific `.env` files.
 *   Do **not** commit your actual `.env` files (especially those with tokens/keys) to version control. Add them to your `.gitignore`. (They should already be excluded but make sure).
 
@@ -129,8 +147,8 @@ If you want to run a single bot instance locally without Docker:
 
 1.  **Clone the repository:**
     ```bash
-    git clone <your-repo-url>
-    cd <your-repo-directory>
+    git clone https://github.com/xXG0DLessXx/shapes-inc-telegram-bot
+    cd shapes-inc-telegram-bot
     ```
 
 2.  **Create a virtual environment (recommended):**
@@ -152,10 +170,12 @@ If you want to run a single bot instance locally without Docker:
     SHAPESINC_API_KEY=your_shapes_inc_api_key_here
     SHAPESINC_SHAPE_USERNAME=your_shape_username_here
 
-    # ... other common settings from env.example ...
+    # ... other common settings from example.env ...
+    SEPARATE_TOPIC_HISTORIES=true
     GROUP_FREE_WILL_ENABLED=true
     ENABLE_TOOL_USE=true
     IGNORE_OLD_MESSAGES_ON_STARTUP=false
+    # PERCHANCE_USER_KEY=...
     # etc.
     ```
 
@@ -213,7 +233,7 @@ If you want to run a single bot instance locally without Docker:
 
 *   `/start`: Displays a welcome message.
 *   `/help`: Shows this help message, including available tools and free will status.
-*   `/newchat`: Clears the current conversation history with the bot for the current chat/topic, starting fresh. (Note: This does not work because Shapes.inc manages its own context. Standard Shape commands like `!wack` might be more relevant for resetting context on their end).
+*   `/newchat`: Clears the bot's side of the conversation history for the current chat/topic (respecting `SEPARATE_TOPIC_HISTORIES` setting). This helps the bot "forget" the recent local context. However, Shapes.inc manages its own context on their end; standard Shape commands like `!wack` might be more relevant for a full context reset on their platform. The bot now sends a more specific `X-Channel-Id` header that might help Shapes.inc with their history scoping.
 *   `/activate`: (Groups/Topics only) Make the bot respond to every message in the current group (general chat) or specific topic.
 *   `/deactivate`: (Groups/Topics only) Stop the bot from responding to every message in the current group/topic, reverting to default behavior (mentions, replies, free will).
 *   `/imagine <prompt>`: (Experimental) Generates images based on your prompt using Bing Image Creator. Requires `BING_AUTH_COOKIE` to be set and `BingImageCreator` library to be functional.
@@ -221,27 +241,32 @@ If you want to run a single bot instance locally without Docker:
 
 To interact with the bot, you can:
 *   Send it a direct message.
-*   Send it an image (with or without a caption).
-*   Send it a voice message.
+*   Send it an image (with or without a caption, or as a document).
+*   Send it a voice message (or as an audio document).
+*   Send it a text document (`.txt`, `.md`, `.docx`, `.odt`).
 *   In group chats (including those with Topics):
     *   Reply directly to one of the bot's messages.
     *   Mention the bot by its username (e.g., `@your_bot_username <your message>`).
     *   If in a group/topic where `/activate` has been used, the bot will respond to all messages in that specific context.
-    *   Wait for it to interject based on its "free will" settings for that specific chat/topic (if enabled).
+    *   Wait for it to interject based on its "free will" settings for that specific chat/topic (if enabled, respecting `SEPARATE_TOPIC_HISTORIES`).
 
 ## Important Notes & Known Issues
 
 *   **Code Quality:** As stated, this is "quick and dirty" code. It's functional but could benefit from significant refactoring, better error handling, and more structured logging.
-*   **Bing Image Generation (`/imagine`):** This feature relies on the `BingImageCreator` library and an authentication cookie. This method of accessing Bing Image Creator is unofficial and prone to breaking if Microsoft changes its authentication mechanisms. **It may not work reliably or at all.**
-*   **Voice Message Processing:** The bot sends the Telegram-provided URL for the voice message directly to the Shapes.inc API. The accessibility and processing of this URL by the API depend on Shapes.inc's capabilities.
-*   **Error Handling:** While there's a general error handler, specific errors within tool execution or API calls might not always be gracefully reported to the user. More detailed error propagation to the user could be improved.
+*   **Bing Image Generation (`/imagine`):** This feature remains experimental and prone to breaking.
+*   **Anime Image Generation (`generate_anime_image` tool):** This new tool uses the Perchance API. It requires a `PERCHANCE_USER_KEY`. The stability of this third-party API is not guaranteed.
+*   **Document Processing:** The bot can extract text from `.txt`, `.md`, `.docx`, and `.odt` files. Images and audio files sent as documents are also processed. There's a `MAX_TEXT_FILE_SIZE` limit (default 500KB).
+*   **Voice/Audio Message Processing:** The bot sends the Telegram-provided URL for voice/audio messages (and audio documents) directly to the Shapes.inc API. The API must be ableto access and process these URLs.
+*   **Error Handling:** While there's a general error handler, specific errors within tool execution or API calls might not always be gracefully reported to the user. Retries for empty AI responses have been added.
 *   **Telegram Topic Support Details:**
-    *   Conversation history (`/newchat`), free will mode, and tool usage (e.g., polls) are scoped to individual topics within a group, or to the general chat area if topics are not used or the message is not in a topic.
-    *   The bot attempts to cache topic names when they are created or edited for more user-friendly logging and contextual prompts.
-    *   If `IGNORE_OLD_MESSAGES_ON_STARTUP` is set to `true`, the bot will skip processing messages (including topic creation/edit events for caching) that occurred before it started. This can be useful to prevent processing a backlog of messages on restart.
-*   **Typing Indicator in Groups with Topics:** The bot's typing indicator might not consistently show in the 'General' chat area of a group with topics when a user *replies* to a message (it typically works if the bot is directly pinged by its username in the reply). However, the typing indicator generally functions correctly within specific topics, in standard group chats (without topics), and in direct messages with the bot.
-*   **`network_mode: "host"` in Docker Compose:** This is used for simplicity in the provided `docker-compose.yml`. It means the containers share the host's network stack. For more isolated setups, you might consider removing it (though not strictly needed for polling bots if no direct inbound connections are required by the bot itself).
+    *   The `SEPARATE_TOPIC_HISTORIES` environment variable controls whether conversation history, free will context, and `/newchat` are scoped per-topic or per-group.
+    *   The bot attempts to cache topic names for more user-friendly logging and contextual prompts.
+    *   The bot sends a specific `X-Channel-Id` (e.g., `chatid_topicid` or `chatid_general`) to the Shapes.inc API, which *might* help the API scope its context, depending on their implementation.
+    *   If `IGNORE_OLD_MESSAGES_ON_STARTUP` is set to `true`, the bot will skip processing messages (including topic creation/edit events for caching) that occurred before it started.
+*   **Typing Indicator:** Generally reliable, but minor inconsistencies might still occur in complex topic/reply scenarios.
+*   **`network_mode: "host"` in Docker Compose:** Used for simplicity. Consider alternatives for more isolated production setups.
 *   **Security:** Be very careful with your API keys and bot tokens. Do not commit `.env` files containing secrets to public repositories. The whitelisting feature (`ALLOWED_USERS`, `ALLOWED_CHATS`) provides a basic level of access control.
+*   **Concurrent Updates & Locking:** The bot now processes updates concurrently (`app_builder.concurrent_updates(True)`). To prevent race conditions within the same conversation, a locking mechanism (`processing_locks`) is used, ensuring that messages for a specific chat (or topic, if `SEPARATE_TOPIC_HISTORIES` is true) are handled one by one.
 
 ## Contributing
 
@@ -261,6 +286,7 @@ Focus areas for improvement could include:
 *   Enhancing the toolset.
 *   Implementing a more robust voice message handling (e.g., downloading and re-hosting if direct URL access fails for the API).
 *   Improving the reliability of the typing indicator in all group/topic scenarios.
+*   Further refining the interaction between bot-side history and Shapes.inc's context management.
 
 ## License
 
