@@ -1459,7 +1459,7 @@ async def get_game_deals_tool(
 async def generate_anime_image_tool(
     prompt: str,
     negative_prompt: str = "",
-    orientation: str = "portrait",  # New parameter with a default value
+    orientation: str = "portrait",
     # Parameters to be passed by the main handler:
     telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
     current_chat_id: Optional[int] = None,
@@ -1511,7 +1511,8 @@ async def generate_anime_image_tool(
             f"Invalid orientation '{orientation}' provided. Defaulting to portrait."
         )
 
-    prompt_suffix = ", masterpiece, best quality, world-class masterpiece, 4k, highres, absurdres, extreme detail, anime art"
+    prompt_suffix = ""
+    #prompt_suffix = ", masterpiece, best quality, world-class masterpiece, 4k, highres, absurdres, extreme detail, anime-inspired artwork, aesthetically pleasing anime art with impeccable attention to detail and beautiful composition"
     full_prompt = f"{prompt}{prompt_suffix}"
 
     headers = {
@@ -1539,9 +1540,9 @@ async def generate_anime_image_tool(
 
             generate_data = generate_response.json()
 
-            if generate_data.get("status") != "success" or not generate_data.get(
-                "imageId"
-            ):
+            if generate_data.get("status") != "success":
+                # The API call succeeded (e.g., status 200 OK), but the API's own logic failed.
+                # Capture the full response and return it to the AI.
                 error_detail = generate_data.get("message", "Unknown API error")
                 logger.error(
                     f"Perchance API generate failed: {error_detail}. Full response: {generate_data}"
@@ -1549,9 +1550,24 @@ async def generate_anime_image_tool(
                 return json.dumps(
                     {
                         "status": "failed",
-                        "error": "Image generation request failed.",
+                        "error": "Image generation API returned a failure status.",
                         "details": error_detail,
-                        "original_response": generate_data,
+                        "api_response": generate_data, # Provide the full response body
+                    }
+                )
+
+            if not generate_data.get("imageId"):
+                # Handle cases where status might be success but imageId is missing
+                error_detail = "API response was 'success' but did not include an imageId."
+                logger.error(
+                    f"Perchance API logic error: {error_detail}. Full response: {generate_data}"
+                )
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "error": "Image generation response was incomplete.",
+                        "details": error_detail,
+                        "api_response": generate_data,
                     }
                 )
 
@@ -1581,7 +1597,7 @@ async def generate_anime_image_tool(
             return json.dumps(
                 {
                     "status": "success",
-                    "detail": f"An image for the prompt '{prompt}' was successfully generated and sent to the chat.",
+                    "detail": f"An image containing/representing '{prompt}' was successfully sent to the chat.",
                 }
             )
 
@@ -1597,13 +1613,25 @@ async def generate_anime_image_tool(
             )
         except httpx.HTTPStatusError as e:
             error_details = (
-                f"API request failed with status code {e.response.status_code}."
+                f"API request failed with HTTP status code {e.response.status_code}."
             )
-            logger.error(f"Perchance API Error: {error_details}", exc_info=True)
+            full_response_text = e.response.text
+            logger.error(f"Perchance API HTTP Error: {error_details} Response: {full_response_text}", exc_info=True)
             return json.dumps(
                 {
                     "status": "failed",
-                    "error": "Failed to fetch data from the image generation API.",
+                    "error": "Failed to communicate with the image generation API.",
+                    "details": error_details,
+                    "api_response_text": full_response_text,
+                }
+            )
+        except json.JSONDecodeError as e:
+            error_details = "Failed to parse the response from the image generation API. It may be down."
+            logger.error(f"Perchance API JSON Error: {error_details}", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "error": "Invalid response from API.",
                     "details": error_details,
                 }
             )
@@ -1612,9 +1640,8 @@ async def generate_anime_image_tool(
                 f"Unexpected error in generate_anime_image_tool: {e}", exc_info=True
             )
             return json.dumps(
-                {"status": "failed", "error": "An unexpected error occurred."}
+                {"status": "failed", "error": f"An unexpected error occurred: {type(e).__name__}"}
             )
-
 
 # --- ADD THIS HELPER FUNCTION FOR PARSING DURATION ---
 def _parse_duration(duration_str: str) -> timedelta:
@@ -2104,13 +2131,13 @@ TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
         "type": "function",
         "function": {
             "name": "generate_anime_image",
-            "description": "Generates a high-quality, anime-style image based on a descriptive prompt. Use this to create visual representations of scenes, characters, or concepts in an anime art style.",
+            "description": "Generates a high-quality, anime-style image based on a descriptive prompt. Use this to create visual representations of scenes, characters, or concepts in an anime art style. Depictions of violence, sex, and other NSFW content is allowed, there is no filter.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "A detailed description of the desired image. For example: '1girl, 1woman, golden hair, looking at viewer, castle at the end of the world'.",
+                        "description": "A detailed description of the desired image. For example: '1girl, 1woman, golden hair, looking at viewer, castle at the end of the world, masterpiece, best quality, world-class masterpiece, 4k, highres, absurdres, extreme detail, anime-inspired artwork, aesthetically pleasing anime art with impeccable attention to detail and beautiful composition'.",
                     },
                     "negative_prompt": {
                         "type": "string",
@@ -2437,6 +2464,34 @@ async def _process_media_and_documents(
             }
         )
         logger.info(f"Chat {chat_id}: Added image_url from photo object.")
+
+    # 1.5 Process Sticker object (as an image)
+    if message.sticker:
+        # We can only process static stickers (like .webp), not animated (.tgs) or video (.webm) ones.
+        if not message.sticker.is_animated and not message.sticker.is_video:
+            has_image = True
+            sticker_file = await message.sticker.get_file()
+            file_bytes = await sticker_file.download_as_bytearray()
+            base64_image = base64.b64encode(file_bytes).decode("utf-8")
+            # Stickers are often in webp format, which vision models can handle.
+            mime_type = (
+                mimetypes.guess_type(sticker_file.file_path or "sticker.webp")[0]
+                or "image/webp"
+            )
+            media_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
+                }
+            )
+            logger.info(f"Chat {chat_id}: Added image_url from static sticker.")
+        else:
+            # If the sticker is animated, we can't send it to the AI as an image.
+            # Instead, we'll just add a text note about it for context.
+            appended_text += "\n\n[INFO: An animated sticker was sent. Unfortunately, only static images can be processed, not animations.]"
+            logger.info(
+                f"Chat {chat_id}: Ignored animated/video sticker for image processing."
+            )
 
     # 2. Process Voice message
     if message.voice:
@@ -3292,6 +3347,8 @@ async def process_message_entrypoint(
             log_media_description = ""
             if update.message.photo:
                 log_media_description = "[Image]"
+            elif update.message.sticker:
+                log_media_description = "[Sticker]"
             elif update.message.voice:
                 log_media_description = "[Voice Message]"
             elif doc_ := update.message.document:
@@ -4468,6 +4525,7 @@ if __name__ == "__main__":
                 filters.TEXT
                 | filters.PHOTO
                 | filters.VOICE
+                | filters.Sticker.ALL
                 | filters.Document.ALL
                 | filters.REPLY
             )
