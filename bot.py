@@ -249,8 +249,6 @@ def telegram_markdown_v2_escape(text: str) -> str:
                 )
             break
     return restored_text
-
-
 # --- END OF MARKDOWNV2 ESCAPE CODE ---
 
 # --- START OF INTELLIGENT SPLITTING CODE ---
@@ -451,8 +449,6 @@ def split_message_with_markdown_balancing(
             lgr.error(f"SplitLoop PROGRESS: Empty segment. Advancing by 1.")
             current_pos += 1
     return [p for p in final_parts if p is not None]
-
-
 # --- END OF INTELLIGENT SPLITTING CODE ---
 
 # --- Global Config & Setup ---
@@ -633,8 +629,6 @@ async def send_message_to_chat_or_general(
             f"Chat {chat_id} (thread {preferred_thread_id}): Unexpected error during send_message. Error: {e_other_send}"
         )
         raise e_other_send
-
-
 # --- END OF HELPER FUNCTION ---
 
 # Add helper functions for media with fallback logic
@@ -1616,7 +1610,10 @@ async def generate_anime_image_tool(
                 f"API request failed with HTTP status code {e.response.status_code}."
             )
             full_response_text = e.response.text
-            logger.error(f"Perchance API HTTP Error: {error_details} Response: {full_response_text}", exc_info=True)
+            logger.error(
+                f"Perchance API HTTP Error: {error_details} Response: {full_response_text}",
+                exc_info=True,
+            )
             return json.dumps(
                 {
                     "status": "failed",
@@ -1640,7 +1637,10 @@ async def generate_anime_image_tool(
                 f"Unexpected error in generate_anime_image_tool: {e}", exc_info=True
             )
             return json.dumps(
-                {"status": "failed", "error": f"An unexpected error occurred: {type(e).__name__}"}
+                {
+                    "status": "failed",
+                    "error": f"An unexpected error occurred: {type(e).__name__}",
+                }
             )
 
 # --- ADD THIS HELPER FUNCTION FOR PARSING DURATION ---
@@ -1892,7 +1892,7 @@ async def get_user_info_tool(
         return json.dumps({"error": "An unexpected internal error occurred."})
 
 
-AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
+ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
     "calculator": calculator_tool,
     "get_weather": get_weather_tool,
     "web_search": web_search_tool,
@@ -1903,7 +1903,7 @@ AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
     "generate_anime_image": generate_anime_image_tool,
 }
 
-TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
+ALL_TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
     {
         "type": "function",
         "function": {
@@ -2156,6 +2156,43 @@ TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
     },
 ]
 # --- END OF TOOL DEFINITIONS ---
+
+# --- Granular Tool Control Logic ---
+# These will hold the tools that are actually active based on the .env configuration.
+ACTIVE_TOOL_DEFINITIONS: list[ChatCompletionToolParam] = []
+ACTIVE_TOOLS_PYTHON_FUNCTIONS: Dict[str, Any] = {}
+
+active_tools_env = os.getenv("ACTIVE_TOOLS")
+
+if active_tools_env is None:
+    # If the variable is not set at all, enable all tools for backward compatibility.
+    logger.info("ACTIVE_TOOLS environment variable not set. Activating all available tools.")
+    ACTIVE_TOOL_DEFINITIONS = ALL_TOOL_DEFINITIONS_FOR_API
+    ACTIVE_TOOLS_PYTHON_FUNCTIONS = ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS
+else:
+    # If the variable is set (even if empty), parse it.
+    # An empty string means NO tools should be active.
+    active_tool_names = {name.strip() for name in active_tools_env.split(',') if name.strip()}
+    logger.info(f"ACTIVE_TOOLS configured. Activating: {sorted(list(active_tool_names)) if active_tool_names else 'None'}")
+
+    # Filter the API definitions
+    for tool_def in ALL_TOOL_DEFINITIONS_FOR_API:
+        if tool_def.get("function", {}).get("name") in active_tool_names:
+            ACTIVE_TOOL_DEFINITIONS.append(tool_def)
+
+    # Filter the Python functions
+    for tool_name, func in ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS.items():
+        if tool_name in active_tool_names:
+            ACTIVE_TOOLS_PYTHON_FUNCTIONS[tool_name] = func
+
+    # Log a warning for any invalid tool names specified in the .env file
+    all_possible_tool_names = set(ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS.keys())
+    invalid_names = active_tool_names - all_possible_tool_names
+    if invalid_names:
+        logger.warning(
+            f"Invalid tool names found in ACTIVE_TOOLS environment variable and will be ignored: {sorted(list(invalid_names))}"
+        )
+# --- END OF Granular Tool Control Logic ---
 
 # --- UTILITY FUNCTIONS ---
 def get_display_name(user: Optional[TelegramUser]) -> str:
@@ -2628,8 +2665,6 @@ async def _process_media_and_documents(
                         appended_text += f"\n\n[INFO: Could not extract text from the attached document '{doc_name}'.]"
 
     return has_image, has_voice, appended_text, media_parts
-
-
 # --- END OF UTILITY FUNCTIONS ---
 
 # --- Status Update Handler for Forum Topics (to populate cache) ---
@@ -2795,9 +2830,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     help_text_parts.append(
         "\nSimply send me a message, an image (with or without a caption), or a voice message to start chatting!"
     )
-    if ENABLE_TOOL_USE and TOOL_DEFINITIONS_FOR_API:
+    if ENABLE_TOOL_USE and ACTIVE_TOOL_DEFINITIONS:
         help_text_parts.append("\nI can also use tools like:")
-        for tool_def in TOOL_DEFINITIONS_FOR_API:
+        for tool_def in ACTIVE_TOOL_DEFINITIONS:
             if tool_def["type"] == "function":
                 func_info = tool_def["function"]
                 desc_first_sentence = func_info["description"].split(".")[0] + "."
@@ -3238,8 +3273,6 @@ async def deactivate_command(
         )
 
     await update.message.reply_text(reply_text)
-
-
 # --- END OF COMMAND HANDLERS ---
 
 # --- Main Message Handler ---
@@ -3728,13 +3761,13 @@ async def process_message_entrypoint(
 
                         if (
                             ENABLE_TOOL_USE
-                            and TOOL_DEFINITIONS_FOR_API
+                            and ACTIVE_TOOL_DEFINITIONS
                             and not is_free_will_triggered
                         ):
                             last_msg_role = (
                                 llm_history[-1].get("role") if llm_history else None
                             )
-                            api_params["tools"] = TOOL_DEFINITIONS_FOR_API
+                            api_params["tools"] = ACTIVE_TOOL_DEFINITIONS
                             api_params["tool_choice"] = (
                                 "none" if last_msg_role == "tool" else "auto"
                             )
@@ -3814,9 +3847,9 @@ async def process_message_entrypoint(
                                     tool_call.function.arguments,
                                 )
                                 tool_output = f"Error: Tool '{func_name}' failed."
-                                if func_name in AVAILABLE_TOOLS_PYTHON_FUNCTIONS:
+                                if func_name in ACTIVE_TOOLS_PYTHON_FUNCTIONS:
                                     try:
-                                        py_func = AVAILABLE_TOOLS_PYTHON_FUNCTIONS[
+                                        py_func = ACTIVE_TOOLS_PYTHON_FUNCTIONS[
                                             func_name
                                         ]
                                         parsed_args = json.loads(args_str or "{}")
@@ -4022,66 +4055,99 @@ async def process_message_entrypoint(
                         escaped_text_for_splitting, 4096, logger
                     )
                     for i, part_md in enumerate(message_parts):
-                        try:
-                            await send_message_to_chat_or_general(
-                                context.bot,
-                                chat_id,
-                                part_md,
-                                preferred_thread_id=effective_send_thread_id,
-                                parse_mode=ParseMode.MARKDOWN_V2,
-                            )
-                        except telegram.error.BadRequest:
-                            logger.warning(
-                                f"Chat {chat_id}: MDv2 failed for part {i+1}, fallback to plain."
-                            )
+                        retries = 3  # Maximum number of retries for a single part
+                        for attempt in range(retries):
                             try:
-                                unescape_re = re.compile(
-                                    r"\\([%s])"
-                                    % re.escape(
-                                        _MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST
-                                    )
-                                )
-                                unescaped_part = unescape_re.sub(r"\1", part_md)
+                                # Attempt to send the message part with Markdown
                                 await send_message_to_chat_or_general(
                                     context.bot,
                                     chat_id,
-                                    unescaped_part,
+                                    part_md,
                                     preferred_thread_id=effective_send_thread_id,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                 )
-                            except Exception as e_plain_send:
-                                logger.error(
-                                    f"Chat {chat_id}: Plain text send for chunk {i+1} failed: {e_plain_send}"
+                                break  # Success!
+
+                            except telegram.error.RetryAfter as e:
+                                wait_time = e.retry_after
+                                logger.warning(
+                                    f"Chat {chat_id}: Flood control. Waiting for {wait_time} seconds before retrying."
                                 )
+                                # Respect the wait time given by Telegram
+                                await asyncio.sleep(wait_time)
+                                # The loop will now try again after waiting
+
+                            except telegram.error.BadRequest:
+                                # Logic for Markdown errors
+                                logger.warning(
+                                    f"Chat {chat_id}: MDv2 failed for part {i+1}, fallback to plain."
+                                )
+                                try:
+                                    unescape_re = re.compile(
+                                        r"\\([%s])"
+                                        % re.escape(
+                                            _MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST
+                                        )
+                                    )
+                                    unescaped_part = unescape_re.sub(r"\1", part_md)
+                                    await send_message_to_chat_or_general(
+                                        context.bot,
+                                        chat_id,
+                                        unescaped_part,
+                                        preferred_thread_id=effective_send_thread_id,
+                                    )
+                                except Exception as e_plain_send:
+                                    logger.error(
+                                        f"Chat {chat_id}: Plain text send for chunk {i+1} failed: {e_plain_send}"
+                                    )
+                                break  # Break from retry loop after attempting fallback
+
                         if i < len(message_parts) - 1:
                             await asyncio.sleep(0.75)
 
                 for img_url in image_urls_to_send:
-                    try:
-                        await send_photo_to_chat_or_general(
-                            context.bot,
-                            chat_id,
-                            img_url,
-                            preferred_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_si:
-                        logger.error(
-                            f"Chat {chat_id}: Failed to send image {img_url}: {e_si}",
-                            exc_info=True,
-                        )
+                    for attempt in range(3):  # Add retry loop
+                        try:
+                            await send_photo_to_chat_or_general(
+                                context.bot,
+                                chat_id,
+                                img_url,
+                                preferred_thread_id=effective_send_thread_id,
+                            )
+                            break  # Success
+                        except telegram.error.RetryAfter as e:
+                            logger.warning(
+                                f"Chat {chat_id}: Flood control on image send. Waiting {e.retry_after}s."
+                            )
+                            await asyncio.sleep(e.retry_after)
+                        except Exception as e_si:
+                            logger.error(
+                                f"Chat {chat_id}: Failed to send image {img_url}: {e_si}",
+                                exc_info=True,
+                            )
+                            break  # Break on other errors
                     await asyncio.sleep(0.5)
                 for audio_url in audio_urls_to_send:
-                    try:
-                        await send_audio_to_chat_or_general(
-                            context.bot,
-                            chat_id,
-                            audio_url,
-                            preferred_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_sa:
-                        logger.error(
-                            f"Chat {chat_id}: Failed to send audio {audio_url}: {e_sa}",
-                            exc_info=True,
-                        )
+                    for attempt in range(3):  # Add retry loop
+                        try:
+                            await send_audio_to_chat_or_general(
+                                context.bot,
+                                chat_id,
+                                audio_url,
+                                preferred_thread_id=effective_send_thread_id,
+                            )
+                            break  # Success
+                        except telegram.error.RetryAfter as e:
+                            logger.warning(
+                                f"Chat {chat_id}: Flood control on audio send. Waiting {e.retry_after}s."
+                            )
+                            await asyncio.sleep(e.retry_after)
+                        except Exception as e_sa:
+                            logger.error(
+                                f"Chat {chat_id}: Failed to send audio {audio_url}: {e_sa}",
+                                exc_info=True,
+                            )
+                            break  # Break on other errors
                     await asyncio.sleep(0.5)
 
             except InternalServerError as e_ise:
