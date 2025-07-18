@@ -45,6 +45,7 @@ from telegram import (
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    ConversationHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -62,6 +63,115 @@ from openai import (
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+import sqlite3
+# --- DatabaseManager class ---
+class DatabaseManager:
+    """Handles all database operations for the bot."""
+    def __init__(self, db_file: str):
+        self.db_file = db_file
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._create_tables()
+
+    def _create_tables(self):
+        """Creates the necessary database tables if they don't exist."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_tokens (
+                user_id INTEGER PRIMARY KEY,
+                auth_token TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_histories (
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER,
+                history_json TEXT NOT NULL,
+                last_updated TIMESTAMP NOT NULL,
+                PRIMARY KEY (chat_id, thread_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activated_topics (
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER,
+                PRIMARY KEY (chat_id, thread_id)
+            )
+        """)
+        self.conn.commit()
+        logger.info("Database setup complete. All tables are ready.")
+
+    # --- Token Management ---
+    def save_user_token(self, user_id: int, token: str):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO user_tokens (user_id, auth_token) VALUES (?, ?)",
+            (user_id, token)
+        )
+        self.conn.commit()
+
+    def load_all_user_tokens(self) -> Dict[int, str]:
+        cursor = self.conn.execute("SELECT user_id, auth_token FROM user_tokens")
+        return {row['user_id']: row['auth_token'] for row in cursor.fetchall()}
+
+    # --- History Management ---
+    def save_history(self, chat_id: int, thread_id: Optional[int], history: list):
+        history_json = json.dumps(history)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO conversation_histories (chat_id, thread_id, history_json, last_updated)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, thread_id, history_json, datetime.now())
+        )
+        self.conn.commit()
+
+    def get_history(self, chat_id: int, thread_id: Optional[int]) -> list:
+        cursor = self.conn.execute(
+            "SELECT history_json FROM conversation_histories WHERE chat_id = ? AND thread_id IS ?",
+            (chat_id, thread_id)
+        )
+        row = cursor.fetchone()
+        return json.loads(row['history_json']) if row else []
+
+    def delete_history(self, chat_id: int, thread_id: Optional[int]):
+        self.conn.execute(
+            "DELETE FROM conversation_histories WHERE chat_id = ? AND thread_id IS ?",
+            (chat_id, thread_id)
+        )
+        self.conn.commit()
+        
+    def load_all_histories(self) -> dict:
+        cursor = self.conn.execute("SELECT chat_id, thread_id, history_json FROM conversation_histories")
+        histories = {}
+        for row in cursor.fetchall():
+            key = (row['chat_id'], row['thread_id'])
+            histories[key] = json.loads(row['history_json'])
+        return histories
+        
+    # --- Activation Management ---
+    def activate_topic(self, chat_id: int, thread_id: Optional[int]):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO activated_topics (chat_id, thread_id) VALUES (?, ?)",
+            (chat_id, thread_id)
+        )
+        self.conn.commit()
+        
+    def deactivate_topic(self, chat_id: int, thread_id: Optional[int]):
+        self.conn.execute(
+            "DELETE FROM activated_topics WHERE chat_id = ? AND thread_id IS ?",
+            (chat_id, thread_id)
+        )
+        self.conn.commit()
+
+    def load_all_activated_topics(self) -> Set[Tuple[int, Optional[int]]]:
+        cursor = self.conn.execute("SELECT chat_id, thread_id FROM activated_topics")
+        return {(row['chat_id'], row['thread_id']) for row in cursor.fetchall()}
+
+    def close(self):
+        """Closes the database connection."""
+        self.conn.close()
+# --- End of DatabaseManager class ---
 
 # --- START OF MARKDOWNV2 ESCAPE CODE ---
 _MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST = r"_*\[\]()~`#+\-=|{}.!"
@@ -463,6 +573,7 @@ except ImportError:
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
 SHAPESINC_API_KEY = os.getenv("SHAPESINC_API_KEY")
+SHAPESINC_APP_ID = os.getenv("SHAPESINC_APP_ID")
 SHAPESINC_SHAPE_USERNAME = os.getenv("SHAPESINC_SHAPE_USERNAME")
 ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
 ALLOWED_CHATS_STR = os.getenv("ALLOWED_CHATS", "")
@@ -471,6 +582,7 @@ BING_AUTH_COOKIE = (
 )
 ENABLE_TOOL_USE = os.getenv("ENABLE_TOOL_USE", "false").lower() == "true"
 SHAPES_API_BASE_URL = os.getenv("SHAPES_API_BASE_URL", "https://api.shapes.inc/v1/")
+SHAPES_AUTH_BASE_URL = os.getenv("SHAPES_AUTH_BASE_URL", "https://api.shapes.inc/auth")
 
 SEPARATE_TOPIC_HISTORIES = (
     os.getenv("SEPARATE_TOPIC_HISTORIES", "false").lower() == "true"
@@ -488,6 +600,15 @@ IGNORE_OLD_MESSAGES_ON_STARTUP = (
     os.getenv("IGNORE_OLD_MESSAGES_ON_STARTUP", "false").lower() == "true"
 )
 BOT_STARTUP_TIMESTAMP: Optional[datetime] = None  # Will be set in main
+
+if not SHAPESINC_APP_ID:
+    logger.warning("SHAPESINC_APP_ID not set in .env. Auth command will not work correctly.")
+
+# This dictionary is now just a cache, loaded from the DB at startup
+user_auth_tokens: Dict[int, str] = {}
+
+# States for ConversationHandler
+AWAITING_CODE = 1
 
 try:
     GROUP_FREE_WILL_PROBABILITY = float(GROUP_FREE_WILL_PROBABILITY_STR)
@@ -2817,6 +2938,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/newchat - Clear the current conversation history (for this topic/chat) and start fresh.",
         "/activate - (Groups/Topics only) Make me respond to every message in this specific group/topic.",
         "/deactivate - (Groups/Topics only) Stop me from responding to every message (revert to mentions/replies/free will).",
+        "/auth_shapes - Connect your Shapes.inc account for personalized memory and recognition of Shapes.inc username and persona.",
+        "/cancel - Stop a multi-step process like authentication.",
     ]
     if BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE:
         help_text_parts.append(
@@ -2952,6 +3075,7 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Clear LLM history for this specific thread/chat
     if history_key in chat_histories and chat_histories[history_key]:
         chat_histories[history_key] = []
+        db_manager.delete_history(chat_id, effective_topic_id_for_command)
         logger.info(
             f"LLM Conversation history cleared for chat ID: {chat_id} ({topic_desc})"
         )
@@ -3198,6 +3322,17 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "The /activate command can only be used in groups or supergroups."
         )
         return
+    
+    # --- Check if the user is an admin in the group ---
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("🚫 Sorry, only group administrators can use this command.")
+            return
+    except telegram.error.BadRequest as e:
+        logger.error(f"Error checking admin status for user {update.effective_user.id} in chat {update.effective_chat.id}: {e}")
+        await update.message.reply_text("Could not verify your admin status. Please try again.")
+        return
 
     chat_id = update.effective_chat.id
     message_thread_id: Optional[
@@ -3215,6 +3350,7 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_text = f"I am already actively listening in {topic_desc}."
     else:
         activated_chats_topics.add(chat_topic_key)
+        db_manager.activate_topic(chat_id, message_thread_id)
         reply_text = f"✅ Activated! I will now respond to all messages in {topic_desc}."
         logger.info(
             f"Bot activated for chat {chat_id} ({topic_desc}) by user {update.effective_user.id}"
@@ -3250,6 +3386,17 @@ async def deactivate_command(
             "The /deactivate command can only be used in groups or supergroups."
         )
         return
+    
+    # --- Check if the user is an admin in the group ---
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("🚫 Sorry, only group administrators can use this command.")
+            return
+    except telegram.error.BadRequest as e:
+        logger.error(f"Error checking admin status for user {update.effective_user.id} in chat {update.effective_chat.id}: {e}")
+        await update.message.reply_text("Could not verify your admin status. Please try again.")
+        return
 
     chat_id = update.effective_chat.id
     message_thread_id: Optional[int] = update.message.message_thread_id
@@ -3263,6 +3410,7 @@ async def deactivate_command(
 
     if chat_topic_key in activated_chats_topics:
         activated_chats_topics.remove(chat_topic_key)
+        db_manager.deactivate_topic(chat_id, message_thread_id)
         reply_text = f"💤 Deactivated. I will no longer respond to all messages in {topic_desc}. (I'll still respond to mentions, replies, or free will)."
         logger.info(
             f"Bot deactivated for chat {chat_id} ({topic_desc}) by user {update.effective_user.id}"
@@ -3273,6 +3421,94 @@ async def deactivate_command(
         )
 
     await update.message.reply_text(reply_text)
+
+
+# --- AUTHENTICATION FUNCTIONS USING ConversationHandler ---
+async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the auth conversation. Sends the link and asks for the code."""
+    if not update.message or not update.effective_user:
+        return ConversationHandler.END
+
+    if not SHAPESINC_APP_ID:
+        await update.message.reply_text("The authentication feature is not configured by the bot admin (missing App ID).")
+        return ConversationHandler.END # End the conversation
+
+    # This part is the same as your old command
+    auth_url = f"https://shapes.inc/authorize?app_id={SHAPESINC_APP_ID}"
+    reply_text = (
+        "*🔐 AUTHENTICATION PROCESS STARTED*\n"
+        "------------------------------------\n"
+        "*Step 1: Get Your Code* ➡️\n"
+        "Click the link below. A new page will open and give you a one-time code.\n\n"
+        f"[🔗 Authorize on Shapes.inc]({auth_url})\n"
+        "------------------------------------\n"
+        "*Step 2: Send the Code Here* 🔢\n"
+        "Once you have the code, *paste it directly into this chat and press send*.\n\n"
+        "_I am now waiting only for your code._\n"
+        "_Type_ /cancel _to abort._"
+    )
+
+    await send_message_to_chat_or_general(
+        context.bot,
+        update.effective_chat.id,
+        telegram_markdown_v2_escape(reply_text),
+        preferred_thread_id=update.message.message_thread_id,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    
+    # Tell the ConversationHandler that we are now waiting for the user's code
+    return AWAITING_CODE
+
+
+async def auth_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives the code, exchanges it for a token, and ends the conversation."""
+    if not update.message or not update.effective_user or not update.message.text:
+        await update.message.reply_text("Something went wrong. Please try starting with /auth_shapes again.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    one_time_code = update.message.text.strip()
+    status_msg = await update.message.reply_text("Verifying your one-time code...")
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+            response = await client.post(
+                f"{SHAPES_AUTH_BASE_URL}/nonce",
+                json={"app_id": SHAPESINC_APP_ID, "code": one_time_code},
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            auth_token = data.get("auth_token")
+
+            if not auth_token:
+                await status_msg.edit_text("Authentication failed. The API did not return an auth token. Please try again or type /cancel.")
+                return AWAITING_CODE # Stay in the same state to allow another try
+
+            # Store the token
+            user_auth_tokens[user_id] = auth_token
+            db_manager.save_user_token(user_id, auth_token)
+            
+            logger.info(f"Successfully obtained and stored Shapes.inc auth token for user {user_id}.")
+            await status_msg.edit_text("✅ Authentication successful! I will now recognize you by your Shapes.inc account.")
+
+    except httpx.HTTPStatusError as e:
+        await status_msg.edit_text(f"Authentication failed (Code: {e.response.status_code}). Please check your code and send it again, or type /cancel.")
+        return AWAITING_CODE # Stay in the same state
+    except Exception as e:
+        logger.error(f"Unexpected error during Shapes.inc authentication for user {user_id}: {e}", exc_info=True)
+        await status_msg.edit_text("An unexpected error occurred. Please try again later by starting with /auth_shapes.")
+
+    # The conversation is over
+    return ConversationHandler.END
+
+
+async def auth_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels the authentication process."""
+    if update.message:
+      await update.message.reply_text("Authentication process canceled.")
+    return ConversationHandler.END
 # --- END OF COMMAND HANDLERS ---
 
 # --- Main Message Handler ---
@@ -3696,6 +3932,7 @@ async def process_message_entrypoint(
                 return
 
             llm_history.append({"role": "user", "content": final_llm_content})
+            db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
 
             log_content_summary = ""
             if isinstance(final_llm_content, str):
@@ -3785,10 +4022,31 @@ async def process_message_entrypoint(
                                 channel_id_for_api = f"{chat_id}_general"
                         else:
                             channel_id_for_api = str(chat_id)
-                        custom_headers_for_api = {
-                            "X-User-Id": str(current_user.id),
-                            "X-Channel-Id": channel_id_for_api,
-                        }
+
+
+                        client_for_this_request = aclient_shape  # Default to the global, API-key based client
+                        custom_headers_for_api = {}
+                        # Check if the user has an auth token from the /auth_shapes command
+                        if current_user.id in user_auth_tokens:
+                            logger.info(f"User {current_user.id} has an auth token. Using user-authenticated client.")
+                            client_for_this_request = AsyncOpenAI(
+                                api_key="not-needed",
+                                base_url=SHAPES_API_BASE_URL,
+                                timeout=SHAPES_API_CLIENT_TIMEOUT,
+                                default_headers={
+                                    "X-App-ID": SHAPESINC_APP_ID,
+                                    "X-User-Auth": user_auth_tokens[current_user.id],
+                                    "X-Channel-Id": channel_id_for_api,
+                                },
+                            )
+                        else:
+                            logger.info(f"User {current_user.id} does not have an auth token. Using API key with custom headers.")
+                            # Fallback to the original method if user is not authenticated
+                            custom_headers_for_api = {
+                                "X-User-Id": str(current_user.id),
+                                "X-Channel-Id": channel_id_for_api,
+                            }
+
                         logger.debug(
                             f"API HISTORY SCOPING: X-Channel-Id: {channel_id_for_api} (based on context_id: {effective_topic_context_id})"
                         )
@@ -3796,11 +4054,12 @@ async def process_message_entrypoint(
                         logger.info(
                             f"API Call (Attempt {empty_retry_count+1}, Tool Iter {current_iteration}) for chat {chat_id} (context_id {effective_topic_context_id}). Tool choice: {api_params.get('tool_choice', 'N/A')}."
                         )
-                        response_from_ai = await aclient_shape.chat.completions.create(
+                        response_from_ai = await client_for_this_request.chat.completions.create(
                             **api_params, extra_headers=custom_headers_for_api
                         )
                         ai_msg_obj = response_from_ai.choices[0].message
                         llm_history.append(ai_msg_obj.model_dump(exclude_none=True))
+                        db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
                         logger.debug(
                             f"Chat {chat_id}: Appended assistant response. Last: {str(llm_history[-1])[:150].replace(chr(10),'/N')}..."
                         )
@@ -3900,6 +4159,7 @@ async def process_message_entrypoint(
                                     }
                                 )
                             llm_history.extend(tool_results)
+                            db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
                         elif ai_msg_obj.content is not None:
                             text_from_this_iteration = str(ai_msg_obj.content)
                             logger.info(
@@ -4171,6 +4431,7 @@ async def process_message_entrypoint(
                     and llm_history[-1].get("content") == err_msg
                 ):
                     llm_history.append({"role": "assistant", "content": err_msg})
+                    db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
                 if chat_id:
                     try:
                         await send_message_to_chat_or_general(
@@ -4199,6 +4460,7 @@ async def process_message_entrypoint(
                     and llm_history[-1].get("content") == err_msg
                 ):
                     llm_history.append({"role": "assistant", "content": err_msg})
+                    db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
                 if chat_id:
                     try:
                         await send_message_to_chat_or_general(
@@ -4508,9 +4770,8 @@ async def post_initialization(application: Application) -> None:
         BotCommand("help", "Show this help message."),
         BotCommand("newchat", "Clear conversation history for this topic/chat."),
         BotCommand("activate", "(Groups/Topics) Respond to all messages here."),
-        BotCommand(
-            "deactivate", "(Groups/Topics) Stop responding to all messages here."
-        ),
+        BotCommand("deactivate", "(Groups/Topics) Stop responding to all messages here."),
+        BotCommand("auth_shapes", "Connect your Shapes.inc account."),
     ]
     if (
         BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE
@@ -4535,6 +4796,27 @@ async def post_initialization(application: Application) -> None:
 
 
 if __name__ == "__main__":
+
+    # Get the DB path
+    DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_database.db")
+
+    # Ensure the directory for the database exists inside the container
+    db_directory = os.path.dirname(DATABASE_PATH)
+    if db_directory:
+        os.makedirs(db_directory, exist_ok=True)
+
+    # Initialize the Database Manager with the specified path
+    db_manager = DatabaseManager(DATABASE_PATH)
+    
+    # Load all persistent state into in-memory caches for fast access
+    user_auth_tokens = db_manager.load_all_user_tokens()
+    chat_histories = db_manager.load_all_histories()
+    activated_chats_topics = db_manager.load_all_activated_topics()
+
+    logger.info(f"Loaded {len(user_auth_tokens)} user tokens from DB.")
+    logger.info(f"Loaded {len(chat_histories)} conversation histories from DB.")
+    logger.info(f"Loaded {len(activated_chats_topics)} activated topics from DB.")
+
     # Record bot startup time (UTC)
     BOT_STARTUP_TIMESTAMP = datetime.now(dt_timezone.utc)
     logger.info(f"Bot starting up at: {BOT_STARTUP_TIMESTAMP}")
@@ -4555,6 +4837,17 @@ if __name__ == "__main__":
     app_builder.post_init(post_initialization)  # Register post_init hook
     app = app_builder.build()
 
+    # --- Create the ConversationHandler for Authentication ---
+    auth_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("auth_shapes", auth_start)],
+        states={
+            AWAITING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_receive_code)],
+        },
+        fallbacks=[CommandHandler("cancel", auth_cancel)],
+        per_user=True,  # This is crucial to keep conversations separate for each user
+        per_chat=True,  # And for each user within a specific chat
+    )
+
     # Command Handlers
     # The CommandHandler itself, by default, correctly handles /command@botname scenarios.
     # The internal checks added to each command handler are an additional layer to ensure
@@ -4567,6 +4860,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("newchat", new_chat_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("deactivate", deactivate_command))
+    app.add_handler(auth_conv_handler)
     # Only add imagine/setbingcookie if library is available
     if BING_IMAGE_CREATOR_AVAILABLE:
         # Only add /imagine if cookie is also set initially

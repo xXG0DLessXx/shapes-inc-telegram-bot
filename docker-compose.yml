@@ -1,4 +1,4 @@
-version: '3.8'
+---
 
 # Define a common base configuration for all bot services
 x-common-bot-config: &common-bot-config
@@ -21,6 +21,12 @@ x-common-bot-config: &common-bot-config
   #    max-size: "10m"   # Max size of a log file before rotation
   #    max-file: "3"     # Max number of log files to keep
 
+  # This tells bot.py where to create the database file *inside* the container.
+  # The path is the same for all bots, but the volume mount will make the
+  # actual storage unique for each.
+  environment:
+    - DATABASE_PATH=/app/data/bot_database.db
+
 services:
   # --- Bot Instance 1: Nova ---
   bot-nova-ai:
@@ -33,6 +39,10 @@ services:
     # NO 'environment' block needed here for BOT_TOKEN or SHAPESINC_SHAPE_USERNAME
     # unless you want to override something from nova-ai.env for a quick test,
     # but generally keep secrets out of here.
+    
+    # This binds 'nova_data' in the current directory to the '/app/data' directory in the container
+    volumes:
+      - ./nova_data:/app/data
 
   # --- Bot Instance 2: Amy ---
   bot-discordaddictamy:
@@ -42,6 +52,8 @@ services:
     env_file:
       - common.env
       - discordaddictamy.env
+    volumes:
+      - ./amy_data:/app/data
 
   # --- Add more bot instances as needed ---
   # bot-anotherone:
