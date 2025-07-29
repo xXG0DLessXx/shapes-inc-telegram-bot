@@ -7,6 +7,12 @@ import base64
 import mimetypes
 import asyncio
 import re  # For sanitization and new markdown, and calculator tool
+# telegramify_markdown for advanced message formatting
+import telegramify_markdown
+from telegramify_markdown.type import ContentTypes
+from telegramify_markdown.interpreters import (
+    TextInterpreter, FileInterpreter, MermaidInterpreter, InterpreterChain
+)
 import traceback  # For detailed error handler
 import html  # For detailed error handler
 import httpx  # For specific exception types
@@ -51,6 +57,7 @@ from telegram.ext import (
     ContextTypes,
     Application,
 )
+from telegram.helpers import escape_markdown
 from telegram.constants import ChatAction, ParseMode
 import telegram.error
 
@@ -173,394 +180,6 @@ class DatabaseManager:
         self.conn.close()
 # --- End of DatabaseManager class ---
 
-# --- START OF MARKDOWNV2 ESCAPE CODE ---
-_MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST = r"_*\[\]()~`#+\-=|{}.!"
-_MD_ESCAPE_REGEX_GENERAL = re.compile(
-    r"([%s])" % re.escape(_MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST)
-)
-_PLACEHOLDER_PREFIX = "zYzTgMdPhPrfxzYz"
-_PLACEHOLDER_SUFFIX = "zYzTgMdPhSffxzYz"
-_placeholder_regex_global = re.compile(
-    f"{re.escape(_PLACEHOLDER_PREFIX)}(\\d+){re.escape(_PLACEHOLDER_SUFFIX)}"
-)
-
-
-def _escape_general_markdown_chars(text: str) -> str:
-    return _MD_ESCAPE_REGEX_GENERAL.sub(r"\\\1", text)
-
-
-_styled_text_definitions: List[Tuple[str, str, str, str]] = [
-    ("spoiler", r"(\|\|)", r"(\|\|)", r"\|\|"),
-    ("underline", r"(__)", r"(__)", r"__"),
-    ("bold", r"(\*)", r"(\*)", r"\*"),
-    ("italic", r"(_)", r"(_)(?!_)", r"_"),
-    ("strikethrough", r"(~)", r"(~)(?!~)", r"~"),
-]
-_COMPILED_STYLED_TEXT_PATTERNS: List[
-    Tuple[str, re.Pattern, re.Pattern, re.Pattern]
-] = []
-for (
-    name,
-    open_delim_re_str,
-    close_delim_re_str,
-    literal_delim_for_content,
-) in _styled_text_definitions:
-    content_re_str = (
-        rf"((?!\s)(?:(?!(?<!\\){re.escape(literal_delim_for_content)}).)+?(?<!\s))"
-    )
-    full_pattern = re.compile(
-        open_delim_re_str + content_re_str + close_delim_re_str, re.DOTALL
-    )
-    _COMPILED_STYLED_TEXT_PATTERNS.append(
-        (
-            name,
-            full_pattern,
-            re.compile(open_delim_re_str),
-            re.compile(close_delim_re_str),
-        )
-    )
-_CODE_BLOCK_LANG_RE = r"[\w_#+.-]+"
-
-
-class MarkdownV2ParserContext:
-    def __init__(self):
-        self.placeholders_map: Dict[str, str] = {}
-        self.placeholder_idx: int = 0
-
-    def _get_next_placeholder_key(self) -> str:
-        self.placeholder_idx += 1
-        return f"{_PLACEHOLDER_PREFIX}{self.placeholder_idx}{_PLACEHOLDER_SUFFIX}"
-
-    def add_placeholder(self, content_to_store: str) -> str:
-        ph_key = self._get_next_placeholder_key()
-        self.placeholders_map[ph_key] = content_to_store
-        return ph_key
-
-
-def _telegram_markdown_v2_escape_recursive(
-    current_text: str,
-    ctx: MarkdownV2ParserContext,
-    active_style_type: Optional[str] = None,
-) -> str:
-    if not current_text:
-        return ""
-
-    code_block_re = re.compile(rf"(?s)```(?:({_CODE_BLOCK_LANG_RE})\n)?(.*?)```")
-
-    def replace_code_block(match: re.Match) -> str:
-        language, code_content = match.group(1), match.group(2)
-        escaped_code_for_telegram = code_content.replace("\\", "\\\\").replace(
-            "`", "\\`"
-        )
-        placeholder_value = (
-            f"```{language}\n{escaped_code_for_telegram}```"
-            if language
-            else f"```{escaped_code_for_telegram}```"
-        )
-        return ctx.add_placeholder(placeholder_value)
-
-    current_text = code_block_re.sub(replace_code_block, current_text)
-
-    inline_code_re = re.compile(r"`(.+?)`")
-
-    def replace_inline_code(match: re.Match) -> str:
-        content = match.group(1)
-        escaped_content_for_telegram = content.replace("\\", "\\\\").replace("`", "\\`")
-        return ctx.add_placeholder(f"`{escaped_content_for_telegram}`")
-
-    current_text = inline_code_re.sub(replace_inline_code, current_text)
-
-    link_re = re.compile(r"\[((?:[^\[\]]|\\\[|\\\])*?)\]\(((?:[^()\s\\]|\\.)*?)\)")
-    processed_segments_for_links: List[str] = []
-    last_end_idx_links = 0
-    for m_link in link_re.finditer(current_text):
-        processed_segments_for_links.append(
-            current_text[last_end_idx_links : m_link.start()]
-        )
-        link_text_raw, url_raw = m_link.group(1), m_link.group(2)
-        if not url_raw:
-            processed_segments_for_links.append(
-                _escape_general_markdown_chars(m_link.group(0))
-            )
-        else:
-            escaped_url_for_telegram = url_raw.replace("\\", "\\\\").replace(")", "\\)")
-            recursively_escaped_link_text = _telegram_markdown_v2_escape_recursive(
-                link_text_raw, ctx, None
-            )
-            processed_segments_for_links.append(
-                ctx.add_placeholder(
-                    f"[{recursively_escaped_link_text}]({escaped_url_for_telegram})"
-                )
-            )
-        last_end_idx_links = m_link.end()
-    processed_segments_for_links.append(current_text[last_end_idx_links:])
-    current_text = "".join(processed_segments_for_links)
-
-    for style_name, full_pattern_re, _, _ in _COMPILED_STYLED_TEXT_PATTERNS:
-        if style_name == active_style_type:
-            continue
-        new_segments_styled: List[str] = []
-        last_idx_styled = 0
-        for m_style in full_pattern_re.finditer(current_text):
-            new_segments_styled.append(current_text[last_idx_styled : m_style.start()])
-            opening_delimiter, content_raw, closing_delimiter = (
-                m_style.group(1),
-                m_style.group(2),
-                m_style.group(3),
-            )
-            recursively_escaped_content = _telegram_markdown_v2_escape_recursive(
-                content_raw, ctx, active_style_type=style_name
-            )
-            new_segments_styled.append(
-                ctx.add_placeholder(
-                    f"{opening_delimiter}{recursively_escaped_content}{closing_delimiter}"
-                )
-            )
-            last_idx_styled = m_style.end()
-        new_segments_styled.append(current_text[last_idx_styled:])
-        current_text = "".join(new_segments_styled)
-
-    final_segments: List[str] = []
-    last_idx_final = 0
-    for m_placeholder in _placeholder_regex_global.finditer(current_text):
-        final_segments.append(
-            _escape_general_markdown_chars(
-                current_text[last_idx_final : m_placeholder.start()]
-            )
-        )
-        final_segments.append(m_placeholder.group(0))
-        last_idx_final = m_placeholder.end()
-    final_segments.append(_escape_general_markdown_chars(current_text[last_idx_final:]))
-    return "".join(final_segments)
-
-
-def telegram_markdown_v2_escape(text: str) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"<a?:[a-zA-Z0-9_]+:[0-9]+>", "", text)  # Remove custom emojis
-    ctx = MarkdownV2ParserContext()
-    processed_text = _telegram_markdown_v2_escape_recursive(text, ctx)
-
-    max_restoration_loops = len(ctx.placeholders_map) * 2 + 10
-    count = 0
-    temp_text = processed_text
-    while True:
-        restored_text = _placeholder_regex_global.sub(
-            lambda m: ctx.placeholders_map.get(m.group(0), m.group(0)), temp_text
-        )
-        if restored_text == temp_text:
-            break
-        temp_text = restored_text
-        count += 1
-        if count >= max_restoration_loops:
-            if "logger" in globals():
-                logger.warning(
-                    f"MarkdownV2: Max placeholder restoration loops ({max_restoration_loops}). Finalizing."
-                )
-            break
-    return restored_text
-# --- END OF MARKDOWNV2 ESCAPE CODE ---
-
-# --- START OF INTELLIGENT SPLITTING CODE ---
-_BALANCING_MARKDOWN_DELIMITERS = sorted(
-    ["||", "__", "*", "_", "~"], key=len, reverse=True
-)
-_MAX_DELIMITER_SEQUENCE_LEN = sum(len(d) for d in _BALANCING_MARKDOWN_DELIMITERS)
-_ATOMIC_ENTITY_REGEXES = [
-    re.compile(r"(?s)```(?:[\w_#+.-]*\n)?.*?```"),
-    re.compile(r"`(?:\\.|[^`\n])+?`"),
-    re.compile(r"\[(?:[^\[\]]|\\\[|\\\])*?\]\((?:[^()\s\\]|\\.)*?\)"),
-]
-
-
-def _is_char_escaped_at_pos(text: str, char_pos: int) -> bool:
-    if char_pos == 0:
-        return False
-    num_backslashes = 0
-    k = char_pos - 1
-    while k >= 0 and text[k] == "\\":
-        num_backslashes += 1
-        k -= 1
-    return num_backslashes % 2 == 1
-
-
-def _scan_segment_and_update_style_stack(
-    initial_stack: List[str], content_segment: str, lgr: logging.Logger
-) -> List[str]:
-    current_stack = list(initial_stack)
-    idx = 0
-    while idx < len(content_segment):
-        found_atomic_block = False
-        for atomic_re in _ATOMIC_ENTITY_REGEXES:
-            match = atomic_re.match(content_segment, idx)
-            if match:
-                idx += len(match.group(0))
-                found_atomic_block = True
-                break
-        if found_atomic_block:
-            continue
-        matched_delimiter = None
-        if not _is_char_escaped_at_pos(content_segment, idx):
-            for delim_str in _BALANCING_MARKDOWN_DELIMITERS:
-                if content_segment.startswith(delim_str, idx):
-                    if current_stack and current_stack[-1] == delim_str:
-                        current_stack.pop()
-                    else:
-                        current_stack.append(delim_str)
-                    matched_delimiter = delim_str
-                    break
-        if matched_delimiter:
-            idx += len(matched_delimiter)
-        else:
-            idx += 1
-    return current_stack
-
-
-def get_safe_segment_len(
-    full_text: str, segment_start_pos: int, desired_max_len: int, lgr: logging.Logger
-) -> int:
-    if desired_max_len <= 0:
-        return 0
-    current_safe_len = desired_max_len
-    for atomic_re in _ATOMIC_ENTITY_REGEXES:
-        for match in atomic_re.finditer(full_text):
-            entity_abs_start, entity_abs_end = match.start(), match.end()
-            current_segment_abs_end = segment_start_pos + current_safe_len
-            if (
-                entity_abs_start < current_segment_abs_end
-                and entity_abs_end > current_segment_abs_end
-            ):
-                current_safe_len = max(0, entity_abs_start - segment_start_pos)
-            if entity_abs_start >= segment_start_pos + desired_max_len + 100:
-                break
-    return current_safe_len
-
-
-def split_message_with_markdown_balancing(
-    escaped_text: str, max_part_len: int, lgr: logging.Logger
-) -> List[str]:
-    final_parts: List[str] = []
-    current_pos = 0
-    active_styles_at_part_start: List[str] = []
-    if not escaped_text:
-        return [""]
-
-    while current_pos < len(escaped_text):
-        prefix = "".join(active_styles_at_part_start)
-        max_suffix_len_estimate = (
-            len(prefix)
-            if len(prefix) <= _MAX_DELIMITER_SEQUENCE_LEN
-            else _MAX_DELIMITER_SEQUENCE_LEN
-        )
-        content_len_budget = max(
-            20, max_part_len - len(prefix) - max_suffix_len_estimate
-        )
-        effective_content_len_budget = min(
-            content_len_budget, len(escaped_text) - current_pos
-        )
-        actual_content_segment_len = get_safe_segment_len(
-            escaped_text, current_pos, effective_content_len_budget, lgr
-        )
-
-        if (
-            actual_content_segment_len == 0
-            and effective_content_len_budget > 0
-            and current_pos < len(escaped_text)
-        ):
-            taken_fallback_len = 0
-            for atomic_re in _ATOMIC_ENTITY_REGEXES:
-                match = atomic_re.match(escaped_text, current_pos)
-                if match:
-                    taken_fallback_len = len(match.group(0))
-                    break
-            if taken_fallback_len == 0 and current_pos < len(escaped_text):
-                taken_fallback_len = 1
-            actual_content_segment_len = taken_fallback_len
-
-        current_content_segment = escaped_text[
-            current_pos : current_pos + actual_content_segment_len
-        ]
-        temp_current_content_segment = current_content_segment
-        styles_after_segment_content: List[str] = []
-
-        while True:
-            styles_after_segment_content = _scan_segment_and_update_style_stack(
-                active_styles_at_part_start, temp_current_content_segment, lgr
-            )
-            suffix = "".join(reversed(styles_after_segment_content))
-            final_part_candidate = prefix + temp_current_content_segment + suffix
-            if len(final_part_candidate) <= max_part_len:
-                current_content_segment = temp_current_content_segment
-                break
-            if not temp_current_content_segment:
-                styles_after_segment_content = _scan_segment_and_update_style_stack(
-                    active_styles_at_part_start, current_content_segment, lgr
-                )
-                break
-
-            prev_newline_idx = temp_current_content_segment.rfind(
-                "\n", 0, len(temp_current_content_segment) - 1
-            )
-            if prev_newline_idx != -1:
-                safe_trimmed_len = get_safe_segment_len(
-                    escaped_text, current_pos, prev_newline_idx + 1, lgr
-                )
-                if safe_trimmed_len < len(temp_current_content_segment):
-                    temp_current_content_segment = escaped_text[
-                        current_pos : current_pos + safe_trimmed_len
-                    ]
-                    continue
-            prev_space_idx = temp_current_content_segment.rfind(
-                " ", 0, len(temp_current_content_segment) - 1
-            )
-            if prev_space_idx != -1:
-                safe_trimmed_len = get_safe_segment_len(
-                    escaped_text, current_pos, prev_space_idx + 1, lgr
-                )
-                if safe_trimmed_len < len(temp_current_content_segment):
-                    temp_current_content_segment = escaped_text[
-                        current_pos : current_pos + safe_trimmed_len
-                    ]
-                    continue
-
-            potential_new_len = len(temp_current_content_segment) - 1
-            if potential_new_len <= 0:
-                styles_after_segment_content = _scan_segment_and_update_style_stack(
-                    active_styles_at_part_start, current_content_segment, lgr
-                )
-                break
-            safe_trimmed_len = get_safe_segment_len(
-                escaped_text, current_pos, potential_new_len, lgr
-            )
-            if safe_trimmed_len < len(temp_current_content_segment):
-                temp_current_content_segment = escaped_text[
-                    current_pos : current_pos + safe_trimmed_len
-                ]
-            else:
-                styles_after_segment_content = _scan_segment_and_update_style_stack(
-                    active_styles_at_part_start, current_content_segment, lgr
-                )
-                break
-
-        final_part_to_add = (
-            prefix
-            + current_content_segment
-            + "".join(reversed(styles_after_segment_content))
-        )
-        if final_part_to_add.strip():
-            final_parts.append(final_part_to_add)
-        elif not final_parts and not escaped_text:
-            final_parts.append("")
-
-        active_styles_at_part_start = list(styles_after_segment_content)
-        if len(current_content_segment) > 0:
-            current_pos += len(current_content_segment)
-        elif current_pos < len(escaped_text):
-            lgr.error(f"SplitLoop PROGRESS: Empty segment. Advancing by 1.")
-            current_pos += 1
-    return [p for p in final_parts if p is not None]
-# --- END OF INTELLIGENT SPLITTING CODE ---
-
 # --- Global Config & Setup ---
 try:
     from BingImageCreator import ImageGen
@@ -577,6 +196,9 @@ SHAPESINC_APP_ID = os.getenv("SHAPESINC_APP_ID")
 SHAPESINC_SHAPE_USERNAME = os.getenv("SHAPESINC_SHAPE_USERNAME")
 ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
 ALLOWED_CHATS_STR = os.getenv("ALLOWED_CHATS", "")
+BOT_OWNERS_STR = os.getenv("BOT_OWNERS", "")
+NOTIFY_OWNER_ON_ERROR = os.getenv("NOTIFY_OWNER_ON_ERROR", "true").lower() == "true"
+
 BING_AUTH_COOKIE = (
     os.getenv("BING_AUTH_COOKIE") if BING_IMAGE_CREATOR_AVAILABLE else None
 )
@@ -639,6 +261,7 @@ if not SHAPESINC_SHAPE_USERNAME:
 
 ALLOWED_USERS = [user.strip() for user in ALLOWED_USERS_STR.split(",") if user.strip()]
 ALLOWED_CHATS = [chat.strip() for chat in ALLOWED_CHATS_STR.split(",") if chat.strip()]
+BOT_OWNERS = [owner.strip() for owner in BOT_OWNERS_STR.split(",") if owner.strip()]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -794,7 +417,6 @@ async def send_photo_to_chat_or_general(
         )
         raise e_other
 
-
 async def send_audio_to_chat_or_general(
     bot_instance: Bot,
     chat_id: int,
@@ -836,6 +458,46 @@ async def send_audio_to_chat_or_general(
         )
         raise e_other
 
+async def send_document_to_chat_or_general(
+    bot_instance: Bot,
+    chat_id: int,
+    document: Union[str, bytes, Tuple[str, bytes]],
+    preferred_thread_id: Optional[int],
+    **kwargs,
+) -> Optional[TelegramMessage]:
+    try:
+        return await bot_instance.send_document(
+            chat_id=chat_id,
+            document=document,
+            message_thread_id=preferred_thread_id,
+            **kwargs,
+        )
+    except telegram.error.BadRequest as e:
+        if (
+            "message thread not found" in e.message.lower()
+            and preferred_thread_id is not None
+        ):
+            logger.warning(
+                f"Chat {chat_id}: Preferred thread {preferred_thread_id} not found for document. "
+                f"Attempting to send to general chat instead. Error: {e}"
+            )
+            try:
+                # Fallback: send to general chat (message_thread_id=None)
+                return await bot_instance.send_document(
+                    chat_id=chat_id, document=document, message_thread_id=None, **kwargs
+                )
+            except Exception as e2:
+                logger.error(
+                    f"Chat {chat_id}: Sending document to general chat also failed. Error: {e2}"
+                )
+                raise e2
+        else:
+            raise e
+    except Exception as e_other:
+        logger.error(
+            f"Chat {chat_id} (thread {preferred_thread_id}): Unexpected error during send_document. Error: {e_other}"
+        )
+        raise e_other
 
 # --- TOOL IMPLEMENTATIONS ---
 async def create_poll_tool(
@@ -2316,6 +1978,105 @@ else:
 # --- END OF Granular Tool Control Logic ---
 
 # --- UTILITY FUNCTIONS ---
+async def send_telegramify_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    markdown_content: str,
+    preferred_thread_id: Optional[int],
+) -> None:
+    """
+    Processes a markdown string using telegramify_markdown and sends it to the chat.
+    Handles text splitting, code blocks (as images/files), and other rich content.
+    """
+    if not markdown_content or not markdown_content.strip():
+        logger.warning("send_telegramify_message was called with empty or whitespace-only content.")
+        return
+
+    try:
+        # The library is powerful. It can render code blocks as text, files, or images.
+        # It can also handle things like Mermaid diagrams.
+        interpreter_chain = InterpreterChain([
+            TextInterpreter(),       # Renders most things as pure text
+            FileInterpreter(),       # Renders code blocks as files (or images if short)
+            MermaidInterpreter()     # Renders mermaid diagrams as images
+        ])
+
+        # This is the core call. It processes the entire markdown string from the AI.
+        boxes = await telegramify_markdown.telegramify(
+            content=markdown_content,
+            interpreters_use=interpreter_chain,
+            normalize_whitespace=True, # Recommended for cleaner output
+            latex_escape=True, # Escape LaTeX syntax to prevent rendering issues
+        )
+
+        logger.info(f"Chat {chat_id}: telegramify created {len(boxes)} message parts to send.")
+
+        for i, item in enumerate(boxes):
+            # We add a retry loop with exponential backoff for flood control, a good practice.
+            for attempt in range(4): # 0, 1, 2, 3
+                try:
+                    if item.content_type == ContentTypes.TEXT:
+                        await send_message_to_chat_or_general(
+                            context.bot,
+                            chat_id,
+                            item.content,
+                            preferred_thread_id=preferred_thread_id,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            disable_web_page_preview=True
+                        )
+                    elif item.content_type == ContentTypes.PHOTO:
+                        # The library provides file_data as bytes. We pass it directly to the 'photo' param.
+                        # The filename must be passed as a separate, named argument.
+                        await send_photo_to_chat_or_general(
+                            context.bot,
+                            chat_id,
+                            photo=item.file_data,  # Pass the raw bytes here
+                            preferred_thread_id=preferred_thread_id,
+                            caption=item.caption,
+                            filename=item.file_name,  # Pass the filename as a named argument
+                            parse_mode=ParseMode.MARKDOWN_V2
+                        )
+                    elif item.content_type == ContentTypes.FILE:
+                        await send_document_to_chat_or_general(
+                            context.bot,
+                            chat_id,
+                            document=item.file_data,  # Pass the raw bytes here
+                            preferred_thread_id=preferred_thread_id,
+                            caption=item.caption,
+                            filename=item.file_name,  # Pass the filename as a named argument
+                            parse_mode=ParseMode.MARKDOWN_V2
+                        )
+                    
+                    break # Success, exit retry loop
+
+                except telegram.error.RetryAfter as e:
+                    wait_time = e.retry_after
+                    logger.warning(f"Chat {chat_id}: Flood control triggered. Waiting {wait_time}s before retry {attempt + 1}.")
+                    if wait_time > 20: # Don't wait forever
+                        raise e 
+                    await asyncio.sleep(wait_time)
+                except Exception as e:
+                    logger.error(f"Chat {chat_id}: Failed to send telegramify part {i+1} (type: {item.content_type}). Error: {e}", exc_info=True)
+                    # For most errors other than RetryAfter, we probably shouldn't retry.
+                    raise e # Re-raise to be caught by the main handler
+
+            # A small, polite delay between sending multiple message parts.
+            if i < len(boxes) - 1:
+                await asyncio.sleep(0.8)
+
+    except Exception as e:
+        logger.error(f"Chat {chat_id}: Major error in send_telegramify_message. Error: {e}", exc_info=True)
+        # Fallback to sending a simple error message to the user
+        try:
+            await send_message_to_chat_or_general(
+                context.bot,
+                chat_id,
+                "I encountered a problem while formatting my response. The admin has been notified.",
+                preferred_thread_id=preferred_thread_id,
+            )
+        except Exception as e_fb:
+            logger.error(f"Chat {chat_id}: Failed to send even the fallback error message. Error: {e_fb}")
+
 def get_display_name(user: Optional[TelegramUser]) -> str:
     if not user:
         return "Unknown User"
@@ -2978,7 +2739,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "\n\nNote: Your access to interact with me is currently restricted."
         )
 
-    escaped_help_text = telegram_markdown_v2_escape("\n".join(help_text_parts))
+    escaped_help_text = escape_markdown("\n".join(help_text_parts), version=2)
     try:
         # Use helper to send, respecting thread ID
         await send_message_to_chat_or_general(
@@ -3277,10 +3038,10 @@ async def set_bing_cookie_command(update: Update, context: ContextTypes.DEFAULT_
     user_id_str = str(update.effective_user.id)
     # Check admin and feature availability
     if not (
-        ALLOWED_USERS and user_id_str in ALLOWED_USERS and BING_IMAGE_CREATOR_AVAILABLE
+        BOT_OWNERS and user_id_str in BOT_OWNERS and BING_IMAGE_CREATOR_AVAILABLE
     ):
         await update.message.reply_text(
-            "This command is restricted to authorized administrators or is currently unavailable."
+            "This command is restricted to the bot owner or is currently unavailable."
         )
         return
     if not context.args or len(context.args) != 1:
@@ -3451,7 +3212,7 @@ async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await send_message_to_chat_or_general(
         context.bot,
         update.effective_chat.id,
-        telegram_markdown_v2_escape(reply_text),
+        escape_markdown(reply_text, version=2),
         preferred_thread_id=update.message.message_thread_id,
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
@@ -3990,10 +3751,14 @@ async def process_message_entrypoint(
 
                     while current_iteration < MAX_TOOL_ITERATIONS:
                         current_iteration += 1
-                        messages_for_this_api_call = list(llm_history)
+
+                        #messages_for_this_api_call = list(llm_history)
+                        # Instead of sending the whole history, send ONLY the last message (shapes inc api is stateful and manages the history).
+                        last_message_turn = [llm_history[-1]] if llm_history else []
+
                         api_params: Dict[str, Any] = {
                             "model": f"shapesinc/{SHAPESINC_SHAPE_USERNAME}",
-                            "messages": messages_for_this_api_call,
+                            "messages": last_message_turn,
                         }
 
                         if (
@@ -4270,145 +4035,82 @@ async def process_message_entrypoint(
                     logger.warning(
                         f"Chat {chat_id} (context_id {effective_topic_context_id}): Final AI text empty. Defaulting to error msg."
                     )
-                    text_part_after_media_extraction = "I'm sorry, I couldn't generate a valid response. Please try again."
+                    error_text = "I'm sorry, I couldn't generate a valid response. Please try again."
                     if llm_history:
                         llm_history.append(
                             {
                                 "role": "assistant",
-                                "content": text_part_after_media_extraction,
+                                "content": error_text,
                             }
                         )
-
-                if image_urls_to_send or audio_urls_to_send:
+                    # Send the error message directly
+                    await send_message_to_chat_or_general(
+                        context.bot,
+                        chat_id,
+                        error_text,
+                        preferred_thread_id=effective_send_thread_id,
+                    )
+                else:
+                    # --- HYBRID SENDING LOGIC ---
                     if typing_task and not typing_task.done():
-                        typing_task.cancel()
-                    media_action = (
-                        ChatAction.UPLOAD_PHOTO
-                        if image_urls_to_send
-                        else ChatAction.UPLOAD_VOICE
-                    )
-                    try:
-                        await context.bot.send_chat_action(
-                            chat_id=chat_id,
-                            action=media_action,
-                            message_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_ma:
-                        logger.warning(f"Could not send initial media action: {e_ma}")
-                    typing_task = asyncio.create_task(
-                        _keep_typing_loop(
-                            context,
-                            chat_id,
-                            effective_send_thread_id,
-                            action=media_action,
-                        )
-                    )
+                        typing_task.cancel()  # Cancel "typing..." before we start sending content.
 
-                if text_part_after_media_extraction.strip():
                     logger.info(
-                        f"Chat {chat_id} (context_id {effective_topic_context_id}, send_thread_id {effective_send_thread_id}): Text for user: >>>{text_part_after_media_extraction[:100].replace(chr(10),'/N')}...<<<"
+                        f"Chat {chat_id} (context_id {effective_topic_context_id}, send_thread_id {effective_send_thread_id}): AI Response for user: >>>{final_text_from_llm_before_media_extraction[:120].replace(chr(10),'/N')}...<<<"
                     )
-                    escaped_text_for_splitting = telegram_markdown_v2_escape(
-                        text_part_after_media_extraction
-                    )
-                    message_parts = split_message_with_markdown_balancing(
-                        escaped_text_for_splitting, 4096, logger
-                    )
-                    for i, part_md in enumerate(message_parts):
-                        retries = 3  # Maximum number of retries for a single part
-                        for attempt in range(retries):
-                            try:
-                                # Attempt to send the message part with Markdown
-                                await send_message_to_chat_or_general(
-                                    context.bot,
-                                    chat_id,
-                                    part_md,
-                                    preferred_thread_id=effective_send_thread_id,
-                                    parse_mode=ParseMode.MARKDOWN_V2,
-                                )
-                                break  # Success!
 
-                            except telegram.error.RetryAfter as e:
-                                wait_time = e.retry_after
-                                logger.warning(
-                                    f"Chat {chat_id}: Flood control. Waiting for {wait_time} seconds before retrying."
-                                )
-                                # Respect the wait time given by Telegram
-                                await asyncio.sleep(wait_time)
-                                # The loop will now try again after waiting
+                    # Manually parse for Shapes.inc media URLs first.
+                    image_urls_to_send, audio_urls_to_send = [], []
+                    text_after_stripping_media = final_text_from_llm_before_media_extraction
 
-                            except telegram.error.BadRequest:
-                                # Logic for Markdown errors
-                                logger.warning(
-                                    f"Chat {chat_id}: MDv2 failed for part {i+1}, fallback to plain."
-                                )
-                                try:
-                                    unescape_re = re.compile(
-                                        r"\\([%s])"
-                                        % re.escape(
-                                            _MD_SPECIAL_CHARS_TO_ESCAPE_GENERAL_LIST
-                                        )
-                                    )
-                                    unescaped_part = unescape_re.sub(r"\1", part_md)
-                                    await send_message_to_chat_or_general(
-                                        context.bot,
-                                        chat_id,
-                                        unescaped_part,
-                                        preferred_thread_id=effective_send_thread_id,
-                                    )
-                                except Exception as e_plain_send:
-                                    logger.error(
-                                        f"Chat {chat_id}: Plain text send for chunk {i+1} failed: {e_plain_send}"
-                                    )
-                                break  # Break from retry loop after attempting fallback
+                    img_pattern = re.compile(r"(https://files\.shapes\.inc/[\w.-]+\.(?:png|jpg|jpeg|gif|webp))\b", re.I)
+                    audio_pattern = re.compile(r"(https://files\.shapes\.inc/[\w.-]+\.(?:mp3|ogg|wav|m4a|flac))\b", re.I)
 
-                        if i < len(message_parts) - 1:
-                            await asyncio.sleep(0.75)
+                    # Extract and remove image URLs
+                    found_images = img_pattern.findall(text_after_stripping_media)
+                    if found_images:
+                        image_urls_to_send.extend(found_images)
+                        text_after_stripping_media = img_pattern.sub("", text_after_stripping_media).strip()
 
-                for img_url in image_urls_to_send:
-                    for attempt in range(3):  # Add retry loop
+                    # Extract and remove audio URLs
+                    found_audio = audio_pattern.findall(text_after_stripping_media)
+                    if found_audio:
+                        audio_urls_to_send.extend(found_audio)
+                        text_after_stripping_media = audio_pattern.sub("", text_after_stripping_media).strip()
+
+                    # Send the extracted media files.
+                    for img_url in image_urls_to_send:
                         try:
                             await send_photo_to_chat_or_general(
-                                context.bot,
-                                chat_id,
-                                img_url,
-                                preferred_thread_id=effective_send_thread_id,
+                                context.bot, chat_id, img_url, preferred_thread_id=effective_send_thread_id
                             )
-                            break  # Success
-                        except telegram.error.RetryAfter as e:
-                            logger.warning(
-                                f"Chat {chat_id}: Flood control on image send. Waiting {e.retry_after}s."
-                            )
-                            await asyncio.sleep(e.retry_after)
-                        except Exception as e_si:
-                            logger.error(
-                                f"Chat {chat_id}: Failed to send image {img_url}: {e_si}",
-                                exc_info=True,
-                            )
-                            break  # Break on other errors
-                    await asyncio.sleep(0.5)
-                for audio_url in audio_urls_to_send:
-                    for attempt in range(3):  # Add retry loop
+                        except Exception as e:
+                            logger.error(f"Failed to send Shapes.inc image {img_url}: {e}")
+                        await asyncio.sleep(0.5)
+
+                    for audio_url in audio_urls_to_send:
                         try:
                             await send_audio_to_chat_or_general(
-                                context.bot,
-                                chat_id,
-                                audio_url,
-                                preferred_thread_id=effective_send_thread_id,
+                                context.bot, chat_id, audio_url, preferred_thread_id=effective_send_thread_id
                             )
-                            break  # Success
-                        except telegram.error.RetryAfter as e:
-                            logger.warning(
-                                f"Chat {chat_id}: Flood control on audio send. Waiting {e.retry_after}s."
-                            )
-                            await asyncio.sleep(e.retry_after)
-                        except Exception as e_sa:
-                            logger.error(
-                                f"Chat {chat_id}: Failed to send audio {audio_url}: {e_sa}",
-                                exc_info=True,
-                            )
-                            break  # Break on other errors
-                    await asyncio.sleep(0.5)
+                        except Exception as e:
+                            logger.error(f"Failed to send Shapes.inc audio {audio_url}: {e}")
+                        await asyncio.sleep(0.5)
+
+                    # Process the *remaining* text with telegramify-markdown.
+                    text_after_stripping_media = re.sub(r"\[([^\]]*)\]\(\s*\)", r"\1", text_after_stripping_media)
+                    text_after_stripping_media = re.sub(r"(\r\n|\r|\n){2,}", "\n", text_after_stripping_media).strip()
+
+                    if text_after_stripping_media:
+                        # This function now correctly handles the rest of the message.
+                        await send_telegramify_message(
+                            context,
+                            chat_id,
+                            text_after_stripping_media,
+                            effective_send_thread_id,
+                        )
+                    else:
+                        logger.info(f"Chat {chat_id}: No remaining text to send after processing media URLs.")
 
             except InternalServerError as e_ise:
                 log_ctx_info = (
@@ -4618,16 +4320,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Traceback (last 1500 chars):\n{tb_string[-1500:]}"
     )
 
-    # Determine admin chat ID for notification
-    chat_id_to_notify_admin: Optional[int] = None
-    if ALLOWED_USERS:  # Check if ALLOWED_USERS is populated
+    # Determine owner chat ID for notification
+    chat_id_to_notify_owner: Optional[int] = None
+    if NOTIFY_OWNER_ON_ERROR and BOT_OWNERS:  # Check if notifications are enabled AND owners are set
         try:
-            chat_id_to_notify_admin = int(
-                ALLOWED_USERS[0]
-            )  # Attempt to get the first admin user ID
+            chat_id_to_notify_owner = int(
+                BOT_OWNERS[0]
+            )  # Attempt to get the first owner's user ID
         except (ValueError, IndexError, TypeError):
             logger.error(
-                "No valid admin user ID for error notification from ALLOWED_USERS[0]."
+                "BOT_OWNERS is not configured with a valid user ID. Cannot send error report."
             )
 
     # --- Notify User (Optional) ---
@@ -4664,15 +4366,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
 
     # --- Notify Admin ---
-    if chat_id_to_notify_admin:
+    if chat_id_to_notify_owner:
         # Avoid duplicate notification if admin is the one who experienced the error and was already notified
         if (
             user_notified_by_handler
             and update.effective_chat
-            and update.effective_chat.id == chat_id_to_notify_admin
+            and update.effective_chat.id == chat_id_to_notify_owner
         ):
             logger.info(
-                f"Admin was the user in chat {chat_id_to_notify_admin} (thread {message_thread_id_for_error}) and already notified about the error. Skipping redundant admin report."
+                f"Admin was the user in chat {chat_id_to_notify_owner} (thread {message_thread_id_for_error}) and already notified about the error. Skipping redundant admin report."
             )
         else:
             max_len = 4096  # Telegram message length limit
@@ -4700,7 +4402,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                         len(short_html_err) <= max_len
                     ):  # Check if HTML version is within limits
                         await context.bot.send_message(
-                            chat_id=chat_id_to_notify_admin,
+                            chat_id=chat_id_to_notify_owner,
                             text=short_html_err,
                             parse_mode=ParseMode.HTML,
                         )
@@ -4714,7 +4416,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                 ):
                     if len(send_message_plain) <= max_len:
                         await context.bot.send_message(
-                            chat_id=chat_id_to_notify_admin, text=send_message_plain
+                            chat_id=chat_id_to_notify_owner, text=send_message_plain
                         )
                     else:  # Split long plain text message for admin
                         num_err_chunks = (
@@ -4734,19 +4436,19 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                             )
                             # Ensure chunk with header doesn't exceed max_len
                             await context.bot.send_message(
-                                chat_id=chat_id_to_notify_admin,
+                                chat_id=chat_id_to_notify_owner,
                                 text=(hdr + chunk)[:max_len],
                             )
                             if i_err < num_err_chunks - 1:
                                 await asyncio.sleep(0.5)  # Brief pause between chunks
             except Exception as e_send_err:  # Fallback if sending detailed error fails
                 logger.error(
-                    f"Failed sending detailed error report to admin {chat_id_to_notify_admin}: {e_send_err}"
+                    f"Failed sending detailed error report to admin {chat_id_to_notify_owner}: {e_send_err}"
                 )
                 # Send a minimal plain text error to admin
                 try:
                     await context.bot.send_message(
-                        chat_id=chat_id_to_notify_admin,
+                        chat_id=chat_id_to_notify_owner,
                         text=f"Bot Error in chat {effective_chat_id_for_error} {thread_info_for_error_log}: {str(context.error)[:1000]}\n(Details in server logs. Report sending failed.)",
                     )
                 except Exception as e_final_fb:
@@ -4780,10 +4482,10 @@ async def post_initialization(application: Application) -> None:
             BotCommand("imagine", "Generate images from a prompt (Bing).")
         )
 
-    # setbingcookie is an admin command, only show if BING is available and there are admins
-    if BING_IMAGE_CREATOR_AVAILABLE and ALLOWED_USERS:
+    # setbingcookie is an admin command, only show if BING is available and there are owners
+    if BING_IMAGE_CREATOR_AVAILABLE and BOT_OWNERS:
         bot_commands.append(
-            BotCommand("setbingcookie", "(Admin) Update Bing auth cookie.")
+            BotCommand("setbingcookie", "(Owner) Update Bing auth cookie.")
         )
 
     try:

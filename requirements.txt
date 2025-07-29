@@ -1,6 +1,9 @@
 # Telegram Bot Framework
 python-telegram-bot[ext]>=21.1.1,<22.0.0
 
+# Telegram markdown parsing
+telegramify-markdown[mermaid]==0.5.1
+
 # OpenAI API Client
 openai>=1.35.7,<2.0.0
 
