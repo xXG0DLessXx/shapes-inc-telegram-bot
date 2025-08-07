@@ -57,7 +57,6 @@ from telegram.ext import (
     ContextTypes,
     Application,
 )
-from telegram.helpers import escape_markdown
 from telegram.constants import ChatAction, ParseMode
 import telegram.error
 
@@ -2691,37 +2690,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message_thread_id: Optional[int] = None
     if update.message and update.message.message_thread_id is not None:
         message_thread_id = update.message.message_thread_id
-
+    
+    # We now use standard Markdown syntax (* for bold, ` for code, _ for italic)
+    # because our new helper function will process it correctly.
     help_text_parts = [
-        "Here are the available commands:",
-        "/start - Display the welcome message.",
-        "/help - Show this help message.",
-        "/newchat - Clear the current conversation history (for this topic/chat) and start fresh.",
-        "/activate - (Groups/Topics only) Make me respond to every message in this specific group/topic.",
-        "/deactivate - (Groups/Topics only) Stop me from responding to every message (revert to mentions/replies/free will).",
-        "/auth_shapes - Connect your Shapes.inc account for personalized memory and recognition of Shapes.inc username and persona.",
-        "/cancel - Stop a multi-step process like authentication.",
+        "*Here are the available commands:*",
+        "*/start* - Display the welcome message.",
+        "*/help* - Show this help message.",
+        "*/newchat* - Clear the current conversation history (for this topic/chat) and start fresh.",
+        "*/activate* - (Groups/Topics only) Make me respond to every message in this specific group/topic.",
+        "*/deactivate* - (Groups/Topics only) Stop me from responding to every message.",
+        "*/auth_shapes* - Connect your Shapes.inc account.",
+        "*/cancel* - Stop a multi-step process like authentication.",
     ]
     if BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE:
         help_text_parts.append(
-            "/imagine <prompt> - Generate images based on your prompt using Bing."
+            "*/imagine* `<prompt>` - Generate images based on your prompt using Bing."
         )
-        if ALLOWED_USERS and str(update.effective_user.id) in ALLOWED_USERS:
+        if BOT_OWNERS and str(update.effective_user.id) in BOT_OWNERS:
             help_text_parts.append(
-                "/setbingcookie <cookie_value> - (Admin) Update the Bing authentication cookie."
+                "*/setbingcookie* `<cookie_value>` - (Owner) Update the Bing authentication cookie."
             )
 
     help_text_parts.append(
         "\nSimply send me a message, an image (with or without a caption), or a voice message to start chatting!"
     )
     if ENABLE_TOOL_USE and ACTIVE_TOOL_DEFINITIONS:
-        help_text_parts.append("\nI can also use tools like:")
+        help_text_parts.append("\n*I can also use tools like:*")
         for tool_def in ACTIVE_TOOL_DEFINITIONS:
             if tool_def["type"] == "function":
                 func_info = tool_def["function"]
                 desc_first_sentence = func_info["description"].split(".")[0] + "."
                 help_text_parts.append(
-                    f"  - `{func_info['name']}`: {desc_first_sentence}"
+                    f"  - `{func_info['name']}`: _{desc_first_sentence}_"
                 )
 
     if (
@@ -2729,43 +2730,40 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         and update.effective_chat
         and update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]
     ):
-        # Adjusted comment for thread awareness
         help_text_parts.append(
-            f"\nGroup Free Will is enabled! I might respond randomly about {GROUP_FREE_WILL_PROBABILITY:.1%} of the time, considering the last ~{GROUP_FREE_WILL_CONTEXT_MESSAGES} messages in this specific topic/chat."
+            f"\n*Group Free Will is enabled!* I might respond randomly about *{GROUP_FREE_WILL_PROBABILITY:.1%}* of the time, considering the last `~{GROUP_FREE_WILL_CONTEXT_MESSAGES}` messages in this specific topic/chat."
         )
 
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         help_text_parts.append(
-            "\n\nNote: Your access to interact with me is currently restricted."
+            "\n\n_Note: Your access to interact with me is currently restricted._"
         )
 
-    escaped_help_text = escape_markdown("\n".join(help_text_parts), version=2)
+    # Join the parts into a single standard Markdown string. No more escaping!
+    help_text_markdown = "\n".join(help_text_parts)
+    
     try:
-        # Use helper to send, respecting thread ID
-        await send_message_to_chat_or_general(
-            context.bot,
+        # Use the consistent, correct helper function for sending.
+        await send_telegramify_message(
+            context,
             update.effective_chat.id,
-            escaped_help_text,
+            help_text_markdown,
             preferred_thread_id=message_thread_id,
-            parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as e:
         logger.error(
             f"Failed to send help message to {update.effective_chat.id} (thread {message_thread_id}): {e}"
         )
-        # Fallback to plain text if MDv2 fails for reasons other than thread not found (handled by helper)
+        # Has robust error handling, but we keep a final fallback here just in case.
         try:
-            # Use helper for plain text fallback as well
             await send_message_to_chat_or_general(
                 context.bot,
                 update.effective_chat.id,
-                "\n".join(help_text_parts),  # Send unescaped for plain
+                "There was an error displaying the help message. Please try again later.",
                 preferred_thread_id=message_thread_id,
             )
         except Exception as e2:
-            logger.error(
-                f"Failed to send plain text help fallback to {update.effective_chat.id} (thread {message_thread_id}): {e2}"
-            )
+            logger.error(f"Failed to send plain text help fallback to {update.effective_chat.id} (thread {message_thread_id}): {e2}")
 
 
 async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3209,13 +3207,11 @@ async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "_Type_ /cancel _to abort._"
     )
 
-    await send_message_to_chat_or_general(
-        context.bot,
+    await send_telegramify_message(
+        context,
         update.effective_chat.id,
-        escape_markdown(reply_text, version=2),
+        reply_text,
         preferred_thread_id=update.message.message_thread_id,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True,
     )
     
     # Tell the ConversationHandler that we are now waiting for the user's code
