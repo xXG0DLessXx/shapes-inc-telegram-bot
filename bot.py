@@ -4346,7 +4346,7 @@ async def process_message_entrypoint(
                         await send_message_to_chat_or_general(
                             context.bot,
                             chat_id,
-                            "😵‍💫 Oops! Something went wrong. Noted. Try again. (General error, most likely RATE LIMIT)",
+                            "😵‍💫 Oops! Something went wrong. Try again. (General error, most likely RATE LIMIT! Try using /auth_shapes command if you haven't already.)",
                             preferred_thread_id=effective_send_thread_id,
                         )
                     except Exception as e_send_gen_err:
