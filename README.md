@@ -3,7 +3,7 @@
 This project is a Python-based Telegram bot that leverages the Shapes.inc platform (an OpenAI-compatible API) for conversational AI. It's designed to be extensible, allowing multiple bot "personalities" to run from the same codebase using Docker Compose and separate environment files.
 
 The bot can:
-*   **Persist its state:** Utilizes a **SQLite database** to save conversation histories, user authentication data, and chat settings, ensuring data survives restarts.
+*   **Persist its state & settings:** Utilizes a **SQLite database** to save conversation histories, user authentication data, and bot configuration, allowing settings to be changed dynamically and persist through restarts.
 *   **Authenticate Users:** Offers an `/auth_shapes` flow for users to link their Shapes.inc account, enabling personalized API interactions.
 *   Engage in text-based conversations.
 *   Understand and respond to images sent by users (as direct photos or document attachments).
@@ -27,12 +27,17 @@ The bot can:
     *   Conversation histories for every chat and topic.
     *   User authentication tokens obtained from the Shapes.inc authentication flow.
     *   Topic activation settings (`/activate` status).
+    *   **Bot configuration**, allowing settings to persist and be changed dynamically.
 *   **Advanced Message Formatting:** Uses the `telegramify-markdown` library to:
     *   Intelligently split long messages without breaking markdown formatting.
     *   Automatically render code blocks as image snippets or file attachments (e.g., `.py`, `.html`).
 *   **Shapes.inc User Authentication:**
     *   A new `/auth_shapes` command initiates a secure, multi-step flow for users to connect their Shapes.inc account.
     *   This allows the bot to make API calls on behalf of the authenticated user for a more personalized experience and memory.
+*   **Dynamic & Remote Configuration (Owner-Only):**
+    *   Bot settings are loaded from `.env` files at startup and can be **overridden by values stored in the database**.
+    *   New `/viewsettings` command to display the current bot configuration securely.
+    *   New `/setsetting` command allows bot owners to **change most settings on-the-fly** without restarting the bot. Changes are saved to the database and are persistent.
 *   **State-Aware API Interaction:** The bot now sends only the most recent message turn to the Shapes.inc API, relying on its stateful nature to reduce network overhead.
 *   **Conversational AI:** Powered by Shapes.inc (via `openai` library targeting a custom base URL).
 *   **Multi-Modal Input:** Can process text, images (direct or as documents), voice messages (direct or as documents), and text-based documents (`.txt`, `.md`, `.docx`, `.odt`).
@@ -94,6 +99,8 @@ The bot can:
 ## Setup and Configuration
 
 The bot is configured primarily through environment variables. The `docker-compose.yml` is set up to use a `common.env` file for shared settings and bot-specific `.env` files (e.g., `nova-ai.env`, `discordaddictamy.env`) for per-bot configurations.
+
+Note: The bot now uses a hierarchical settings system. At startup, it first loads default values from your `.env` files. It then connects to the database and loads any settings stored there, which **override** the defaults. This allows you to use the new owner commands to change settings while the bot is running, and those changes will be persistent.
 
 ### 1. Environment Variables
 
@@ -291,7 +298,10 @@ A `bot_data` directory will be created in your project folder, containing the pe
 *   `/activate`: **(Group Admin-only)** Makes the bot respond to every message in the current group/topic.
 *   `/deactivate`: **(Group Admin-only)** Stops the bot from responding to every message in the current group/topic.
 *   `/imagine <prompt>`: (Experimental) Generates images using Bing Image Creator.
-*   `/setbingcookie <cookie_value>`: **(Bot Owner-only)** Updates the Bing authentication cookie. Restricted to users listed in `BOT_OWNERS`.
+*   `/setbingcookie <cookie_value>`: **(Bot Owner-only)** Updates the Bing authentication cookie **and saves it to the database**. Restricted to users listed in `BOT_OWNERS`.
+*   `/viewsettings`: **(Bot Owner-only)** Displays the current bot configuration, hiding sensitive values.
+*   `/setsetting <NAME> <value>`: **(Bot Owner-only)** Changes a setting's value on-the-fly and saves it to the database.
+*   `/setperchancekey <key>`: **(Bot Owner-only)** Sets the Perchance API key and saves it.
 
 ### How to Interact with the Bot
 
@@ -323,6 +333,7 @@ You can interact with the bot in several ways:
     *   The bot sends a specific `X-Channel-Id` (e.g., `chatid_topicid` or `chatid_general`) to the Shapes.inc API, which should help the API scope its context.
     *   If `IGNORE_OLD_MESSAGES_ON_STARTUP` is set to `true`, the bot will skip processing messages that occurred before it started.
 *   **Concurrent Updates & Locking:** The bot processes updates concurrently. To prevent race conditions, a locking mechanism ensures that messages for a specific chat/topic are handled one by one.
+*   **Dynamic Settings System:** The bot's configuration is now dynamic. Bot owners can use the `/setsetting` command to change values like `GROUP_FREE_WILL_PROBABILITY` or the list of `ACTIVE_TOOLS` without a restart. The new values are immediately applied and saved to the database. The `.env` files are now primarily used to set the initial defaults.
 
 ## Contributing
 

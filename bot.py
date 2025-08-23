@@ -105,6 +105,12 @@ class DatabaseManager:
                 PRIMARY KEY (chat_id, thread_id)
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         self.conn.commit()
         logger.info("Database setup complete. All tables are ready.")
 
@@ -174,93 +180,115 @@ class DatabaseManager:
         cursor = self.conn.execute("SELECT chat_id, thread_id FROM activated_topics")
         return {(row['chat_id'], row['thread_id']) for row in cursor.fetchall()}
 
+    # --- Settings Management ---
+    def set_setting(self, key: str, value: str):
+        """Saves or updates a setting in the bot_settings table."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        self.conn.commit()
+        logger.info(f"Setting '{key}' updated in the database.")
+
+    def get_setting(self, key: str) -> Optional[str]:
+        """Retrieves a setting from the bot_settings table."""
+        cursor = self.conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row['value'] if row else None
+
+    def load_all_settings(self) -> Dict[str, str]:
+        """Loads all settings from the bot_settings table into a dictionary."""
+        cursor = self.conn.execute("SELECT key, value FROM bot_settings")
+        return {row['key']: row['value'] for row in cursor.fetchall()}
+
     def close(self):
         """Closes the database connection."""
         self.conn.close()
 # --- End of DatabaseManager class ---
 
 # --- Global Config & Setup ---
+
+# This dictionary will hold all our configuration.
+# We'll load defaults from .env, then override with DB values.
+SETTINGS: Dict[str, Any] = {}
+
+def load_settings():
+    """Loads settings from .env file into the global SETTINGS dictionary."""
+    load_dotenv()
+
+    # --- Load from .env as DEFAULTS ---
+    SETTINGS['TELEGRAM_TOKEN'] = os.getenv("BOT_TOKEN")
+    SETTINGS['SHAPESINC_API_KEY'] = os.getenv("SHAPESINC_API_KEY")
+    SETTINGS['SHAPESINC_APP_ID'] = os.getenv("SHAPESINC_APP_ID")
+    SETTINGS['SHAPESINC_SHAPE_USERNAME'] = os.getenv("SHAPESINC_SHAPE_USERNAME")
+    
+    # Core Bot Settings
+    SETTINGS['ALLOWED_USERS'] = [user.strip() for user in os.getenv("ALLOWED_USERS", "").split(",") if user.strip()]
+    SETTINGS['ALLOWED_CHATS'] = [chat.strip() for chat in os.getenv("ALLOWED_CHATS", "").split(",") if chat.strip()]
+    SETTINGS['BOT_OWNERS'] = [owner.strip() for owner in os.getenv("BOT_OWNERS", "").split(",") if owner.strip()]
+    SETTINGS['NOTIFY_OWNER_ON_ERROR'] = os.getenv("NOTIFY_OWNER_ON_ERROR", "true").lower() == "true"
+    SETTINGS['IGNORE_OLD_MESSAGES_ON_STARTUP'] = os.getenv("IGNORE_OLD_MESSAGES_ON_STARTUP", "false").lower() == "true"
+    SETTINGS['SEPARATE_TOPIC_HISTORIES'] = os.getenv("SEPARATE_TOPIC_HISTORIES", "false").lower() == "true"
+
+    # Feature Flags & Parameters
+    SETTINGS['GROUP_FREE_WILL_ENABLED'] = os.getenv("GROUP_FREE_WILL_ENABLED", "false").lower() == "true"
+    SETTINGS['GROUP_FREE_WILL_PROBABILITY'] = float(os.getenv("GROUP_FREE_WILL_PROBABILITY", "0.05"))
+    SETTINGS['GROUP_FREE_WILL_CONTEXT_MESSAGES'] = int(os.getenv("GROUP_FREE_WILL_CONTEXT_MESSAGES", "5"))
+    SETTINGS['ENABLE_TOOL_USE'] = os.getenv("ENABLE_TOOL_USE", "false").lower() == "true"
+    
+    # API Keys & Endpoints
+    SETTINGS['BING_AUTH_COOKIE'] = os.getenv("BING_AUTH_COOKIE") if BING_IMAGE_CREATOR_AVAILABLE else None
+    SETTINGS['PERCHANCE_USER_KEY'] = os.getenv("PERCHANCE_USER_KEY")
+    SETTINGS['SHAPES_API_BASE_URL'] = os.getenv("SHAPES_API_BASE_URL", "https://api.shapes.inc/v1/")
+    SETTINGS['SHAPES_AUTH_BASE_URL'] = os.getenv("SHAPES_AUTH_BASE_URL", "https://api.shapes.inc/auth")
+
+    # Tool Configuration
+    active_tools_env = os.getenv("ACTIVE_TOOLS")
+    if active_tools_env is None:
+        SETTINGS['ACTIVE_TOOLS'] = {f['function']['name'] for f in ALL_TOOL_DEFINITIONS_FOR_API}
+    else:
+        SETTINGS['ACTIVE_TOOLS'] = {name.strip() for name in active_tools_env.split(',') if name.strip()}
+        
+    logger.info("Loaded default settings from .env file.")
+
+def override_settings_from_db(db_manager: DatabaseManager):
+    """Overrides default settings with values from the database."""
+    db_settings = db_manager.load_all_settings()
+    if not db_settings:
+        logger.info("No settings found in the database. Using defaults from .env.")
+        return
+
+    for key, value in db_settings.items():
+        if key not in SETTINGS:
+            logger.warning(f"Setting '{key}' found in DB but not defined in default settings. Ignoring.")
+            continue
+        
+        # Type conversion is crucial here
+        original_type = type(SETTINGS[key])
+        try:
+            if original_type == bool:
+                new_value = value.lower() in ['true', '1', 't', 'y', 'yes']
+            elif original_type == list or original_type == set:
+                 # Convert comma-separated string back to a list/set
+                new_value_list = [item.strip() for item in value.split(',') if item.strip()]
+                new_value = set(new_value_list) if original_type == set else new_value_list
+            else:
+                new_value = original_type(value) # Handles int, float, str
+            
+            SETTINGS[key] = new_value
+            logger.info(f"Overridden setting '{key}' with value from database.")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Could not convert DB value '{value}' for key '{key}' to type {original_type}. Error: {e}. Using default.")
+    
+    logger.info("Successfully applied settings from the database.")
+
+# --- Initialize other global variables that are not settings ---
 try:
     from BingImageCreator import ImageGen
-
     BING_IMAGE_CREATOR_AVAILABLE = True
 except ImportError:
     BING_IMAGE_CREATOR_AVAILABLE = False
     ImageGen = None
-
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
-SHAPESINC_API_KEY = os.getenv("SHAPESINC_API_KEY")
-SHAPESINC_APP_ID = os.getenv("SHAPESINC_APP_ID")
-SHAPESINC_SHAPE_USERNAME = os.getenv("SHAPESINC_SHAPE_USERNAME")
-ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
-ALLOWED_CHATS_STR = os.getenv("ALLOWED_CHATS", "")
-BOT_OWNERS_STR = os.getenv("BOT_OWNERS", "")
-NOTIFY_OWNER_ON_ERROR = os.getenv("NOTIFY_OWNER_ON_ERROR", "true").lower() == "true"
-
-BING_AUTH_COOKIE = (
-    os.getenv("BING_AUTH_COOKIE") if BING_IMAGE_CREATOR_AVAILABLE else None
-)
-ENABLE_TOOL_USE = os.getenv("ENABLE_TOOL_USE", "false").lower() == "true"
-SHAPES_API_BASE_URL = os.getenv("SHAPES_API_BASE_URL", "https://api.shapes.inc/v1/")
-SHAPES_AUTH_BASE_URL = os.getenv("SHAPES_AUTH_BASE_URL", "https://api.shapes.inc/auth")
-
-SEPARATE_TOPIC_HISTORIES = (
-    os.getenv("SEPARATE_TOPIC_HISTORIES", "false").lower() == "true"
-)
-
-GROUP_FREE_WILL_ENABLED = (
-    os.getenv("GROUP_FREE_WILL_ENABLED", "false").lower() == "true"
-)
-GROUP_FREE_WILL_PROBABILITY_STR = os.getenv("GROUP_FREE_WILL_PROBABILITY", "0.0")
-GROUP_FREE_WILL_CONTEXT_MESSAGES_STR = os.getenv(
-    "GROUP_FREE_WILL_CONTEXT_MESSAGES", "3"
-)
-
-IGNORE_OLD_MESSAGES_ON_STARTUP = (
-    os.getenv("IGNORE_OLD_MESSAGES_ON_STARTUP", "false").lower() == "true"
-)
-BOT_STARTUP_TIMESTAMP: Optional[datetime] = None  # Will be set in main
-
-if not SHAPESINC_APP_ID:
-    logger.warning("SHAPESINC_APP_ID not set in .env. Auth command will not work correctly.")
-
-# This dictionary is now just a cache, loaded from the DB at startup
-user_auth_tokens: Dict[int, str] = {}
-
-# States for ConversationHandler
-AWAITING_CODE = 1
-
-try:
-    GROUP_FREE_WILL_PROBABILITY = float(GROUP_FREE_WILL_PROBABILITY_STR)
-    if not (0.0 <= GROUP_FREE_WILL_PROBABILITY <= 1.0):
-        raise ValueError("GROUP_FREE_WILL_PROBABILITY must be between 0.0 and 1.0")
-except ValueError as e:
-    logging.error(f"Invalid GROUP_FREE_WILL_PROBABILITY: {e}. Disabling free will.")
-    GROUP_FREE_WILL_PROBABILITY = 0.0
-    GROUP_FREE_WILL_ENABLED = False
-
-try:
-    GROUP_FREE_WILL_CONTEXT_MESSAGES = int(GROUP_FREE_WILL_CONTEXT_MESSAGES_STR)
-    if not (0 <= GROUP_FREE_WILL_CONTEXT_MESSAGES <= 20):  # Max 20 for sanity
-        raise ValueError("GROUP_FREE_WILL_CONTEXT_MESSAGES must be between 0 and 20.")
-except ValueError as e:
-    logging.warning(f"Invalid GROUP_FREE_WILL_CONTEXT_MESSAGES: {e}. Defaulting to 3.")
-    GROUP_FREE_WILL_CONTEXT_MESSAGES = 3
-
-SHAPES_API_CLIENT_TIMEOUT = httpx.Timeout(90.0, connect=5.0, read=85.0)
-HTTP_CLIENT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
-
-if not TELEGRAM_TOKEN:
-    raise ValueError("BOT_TOKEN not set in environment.")
-if not SHAPESINC_API_KEY:
-    raise ValueError("SHAPESINC_API_KEY not set in environment.")
-if not SHAPESINC_SHAPE_USERNAME:
-    raise ValueError("SHAPESINC_SHAPE_USERNAME not set in environment.")
-
-ALLOWED_USERS = [user.strip() for user in ALLOWED_USERS_STR.split(",") if user.strip()]
-ALLOWED_CHATS = [chat.strip() for chat in ALLOWED_CHATS_STR.split(",") if chat.strip()]
-BOT_OWNERS = [owner.strip() for owner in BOT_OWNERS_STR.split(",") if owner.strip()]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -268,32 +296,18 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-try:
-    aclient_shape = AsyncOpenAI(
-        api_key=SHAPESINC_API_KEY,
-        base_url=SHAPES_API_BASE_URL,
-        timeout=SHAPES_API_CLIENT_TIMEOUT,
-    )
-    logger.info(
-        f"Shapes client init: {SHAPESINC_SHAPE_USERNAME} at {SHAPES_API_BASE_URL} with timeout {SHAPES_API_CLIENT_TIMEOUT}"
-    )
-    logger.info(f"Tool use: {'ENABLED' if ENABLE_TOOL_USE else 'DISABLED'}.")
-    if GROUP_FREE_WILL_ENABLED:
-        logger.info(
-            f"Group Free Will: ENABLED with probability {GROUP_FREE_WILL_PROBABILITY:.2%} and context of {GROUP_FREE_WILL_CONTEXT_MESSAGES} messages."
-        )
-    else:
-        logger.info("Group Free Will: DISABLED.")
+# This will be initialized in main() after settings are loaded
+aclient_shape: Optional[AsyncOpenAI] = None
 
-    logger.info(
-        f"Separate Topic Histories: {'ENABLED' if SEPARATE_TOPIC_HISTORIES else 'DISABLED'}"
-    )
-    logger.info(
-        f"Ignore old messages on startup: {'ENABLED' if IGNORE_OLD_MESSAGES_ON_STARTUP else 'DISABLED'}"
-    )
-except Exception as e:
-    logger.error(f"Failed to init Shapes client: {e}")
-    raise
+# These can be defined globally as they don't depend on loaded settings
+SHAPES_API_CLIENT_TIMEOUT = httpx.Timeout(90.0, connect=5.0, read=85.0)
+HTTP_CLIENT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+# This will be set in main() once the bot is ready to start
+BOT_STARTUP_TIMESTAMP: Optional[datetime] = None
+
+# States for ConversationHandler
+AWAITING_CODE = 1
 
 # Stores conversation history per chat_id and thread_id tuple
 chat_histories: dict[tuple[int, Optional[int]], list[ChatCompletionMessageParam]] = {}
@@ -373,6 +387,32 @@ async def send_message_to_chat_or_general(
         )
         raise e_other_send
 # --- END OF HELPER FUNCTION ---
+
+async def is_owner(update: Update) -> bool:
+    """Checks if the user sending the command is a bot owner."""
+    if not update.effective_user:
+        return False
+    return str(update.effective_user.id) in SETTINGS.get('BOT_OWNERS', [])
+
+# Helper function to rebuild tool lists after changing ACTIVE_TOOLS
+def rebuild_active_tool_lists():
+    """Rebuilds the active tool lists based on the current SETTINGS."""
+    global ACTIVE_TOOL_DEFINITIONS, ACTIVE_TOOLS_PYTHON_FUNCTIONS
+    
+    active_tool_names = SETTINGS.get('ACTIVE_TOOLS', set())
+    
+    ACTIVE_TOOL_DEFINITIONS.clear()
+    ACTIVE_TOOLS_PYTHON_FUNCTIONS.clear()
+
+    for tool_def in ALL_TOOL_DEFINITIONS_FOR_API:
+        if tool_def.get("function", {}).get("name") in active_tool_names:
+            ACTIVE_TOOL_DEFINITIONS.append(tool_def)
+
+    for tool_name, func in ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS.items():
+        if tool_name in active_tool_names:
+            ACTIVE_TOOLS_PYTHON_FUNCTIONS[tool_name] = func
+    
+    logger.info(f"Rebuilt active tool lists. Now active: {sorted(list(active_tool_names)) if active_tool_names else 'None'}")
 
 # Add helper functions for media with fallback logic
 async def send_photo_to_chat_or_general(
@@ -1261,7 +1301,7 @@ async def generate_anime_image_tool(
 
     API_BASE_URL = "https://image-generation.perchance.org/api"
     # This key may expire. If it does, you'll need to regenerate it.
-    USER_KEY = os.getenv("PERCHANCE_USER_KEY")
+    USER_KEY = SETTINGS['PERCHANCE_USER_KEY']
     if not USER_KEY:
         return json.dumps(
             {
@@ -1491,7 +1531,7 @@ async def restrict_user_in_chat_tool(
 
         # --- SAFETY CHECK 3: Get target user's status to ensure they are not an admin ---
         target_member = await bot.get_chat_member(current_chat_id, user_id)
-        if target_member.status in [target_member.ADMINISTRATOR, target_member.CREATOR]:
+        if target_member.status in [telegram.ChatMember.ADMINISTRATOR, telegram.ChatMember.OWNER]:
             return json.dumps(
                 {
                     "status": "failed",
@@ -1939,42 +1979,9 @@ ALL_TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
 ]
 # --- END OF TOOL DEFINITIONS ---
 
-# --- Granular Tool Control Logic ---
-# These will hold the tools that are actually active based on the .env configuration.
+# These will hold the tools that are actually active based on the configuration.
 ACTIVE_TOOL_DEFINITIONS: list[ChatCompletionToolParam] = []
 ACTIVE_TOOLS_PYTHON_FUNCTIONS: Dict[str, Any] = {}
-
-active_tools_env = os.getenv("ACTIVE_TOOLS")
-
-if active_tools_env is None:
-    # If the variable is not set at all, enable all tools for backward compatibility.
-    logger.info("ACTIVE_TOOLS environment variable not set. Activating all available tools.")
-    ACTIVE_TOOL_DEFINITIONS = ALL_TOOL_DEFINITIONS_FOR_API
-    ACTIVE_TOOLS_PYTHON_FUNCTIONS = ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS
-else:
-    # If the variable is set (even if empty), parse it.
-    # An empty string means NO tools should be active.
-    active_tool_names = {name.strip() for name in active_tools_env.split(',') if name.strip()}
-    logger.info(f"ACTIVE_TOOLS configured. Activating: {sorted(list(active_tool_names)) if active_tool_names else 'None'}")
-
-    # Filter the API definitions
-    for tool_def in ALL_TOOL_DEFINITIONS_FOR_API:
-        if tool_def.get("function", {}).get("name") in active_tool_names:
-            ACTIVE_TOOL_DEFINITIONS.append(tool_def)
-
-    # Filter the Python functions
-    for tool_name, func in ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS.items():
-        if tool_name in active_tool_names:
-            ACTIVE_TOOLS_PYTHON_FUNCTIONS[tool_name] = func
-
-    # Log a warning for any invalid tool names specified in the .env file
-    all_possible_tool_names = set(ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS.keys())
-    invalid_names = active_tool_names - all_possible_tool_names
-    if invalid_names:
-        logger.warning(
-            f"Invalid tool names found in ACTIVE_TOOLS environment variable and will be ignored: {sorted(list(invalid_names))}"
-        )
-# --- END OF Granular Tool Control Logic ---
 
 # --- UTILITY FUNCTIONS ---
 async def send_telegramify_message(
@@ -2088,11 +2095,13 @@ def get_display_name(user: Optional[TelegramUser]) -> str:
 
 
 def is_user_or_chat_allowed(user_id: int, chat_id: int) -> bool:
-    if not ALLOWED_USERS and not ALLOWED_CHATS:
+    allowed_users = SETTINGS.get('ALLOWED_USERS', [])
+    allowed_chats = SETTINGS.get('ALLOWED_CHATS', [])
+    if not allowed_users and not allowed_chats:
         return True
-    if ALLOWED_USERS and str(user_id) in ALLOWED_USERS:
+    if allowed_users and str(user_id) in allowed_users:
         return True
-    if ALLOWED_CHATS and str(chat_id) in ALLOWED_CHATS:
+    if allowed_chats and str(chat_id) in allowed_chats:
         return True
     return False
 
@@ -2557,7 +2566,7 @@ async def handle_forum_topic_updates(
         return
 
     # Ignore old status updates if feature is enabled
-    if IGNORE_OLD_MESSAGES_ON_STARTUP and BOT_STARTUP_TIMESTAMP:
+    if SETTINGS['IGNORE_OLD_MESSAGES_ON_STARTUP'] and BOT_STARTUP_TIMESTAMP:
         message_date_utc = (
             update.message.date
         )  # Status update messages also have a date
@@ -2653,7 +2662,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         message_thread_id = update.message.message_thread_id
 
     start_message = (
-        f"Hello! I am {SHAPESINC_SHAPE_USERNAME}, chatting here on Telegram! "
+        f"Hello! I am {SETTINGS['SHAPESINC_SHAPE_USERNAME']}, chatting here on Telegram! "
         "I can chat, use tools, and even understand images and voice messages.\n\n"
         "Type /help to see a list of commands."
     )
@@ -2694,29 +2703,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # We now use standard Markdown syntax (* for bold, ` for code, _ for italic)
     # because our new helper function will process it correctly.
     help_text_parts = [
-        "*Here are the available commands:*",
-        "*/start* - Display the welcome message.",
-        "*/help* - Show this help message.",
-        "*/newchat* - Clear the current conversation history (for this topic/chat) and start fresh.",
-        "*/activate* - (Groups/Topics only) Make me respond to every message in this specific group/topic.",
-        "*/deactivate* - (Groups/Topics only) Stop me from responding to every message.",
-        "*/auth_shapes* - Connect your Shapes.inc account.",
-        "*/cancel* - Stop a multi-step process like authentication.",
+        "**Here are the available commands:**",
+        "**/start** - Display the welcome message.",
+        "**/help** - Show this help message.",
+        "**/newchat** - Clear the current conversation history (for this topic/chat) and start fresh.",
+        "**/activate** - (Groups/Topics only) Make me respond to every message in this specific group/topic.",
+        "**/deactivate** - (Groups/Topics only) Stop me from responding to every message.",
+        "**/auth_shapes** - Connect your Shapes.inc account.",
+        "**/cancel** - Stop a multi-step process like authentication.",
     ]
-    if BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE:
+    if BING_IMAGE_CREATOR_AVAILABLE and SETTINGS['BING_AUTH_COOKIE']:
         help_text_parts.append(
-            "*/imagine* `<prompt>` - Generate images based on your prompt using Bing."
+            "**/imagine** `<prompt>` - Generate images based on your prompt using Bing."
         )
-        if BOT_OWNERS and str(update.effective_user.id) in BOT_OWNERS:
+        if SETTINGS['BOT_OWNERS'] and str(update.effective_user.id) in SETTINGS['BOT_OWNERS']:
             help_text_parts.append(
-                "*/setbingcookie* `<cookie_value>` - (Owner) Update the Bing authentication cookie."
+                "**/setbingcookie** `<cookie_value>` - (Owner) Update the Bing authentication cookie."
             )
 
     help_text_parts.append(
         "\nSimply send me a message, an image (with or without a caption), or a voice message to start chatting!"
     )
-    if ENABLE_TOOL_USE and ACTIVE_TOOL_DEFINITIONS:
-        help_text_parts.append("\n*I can also use tools like:*")
+    if SETTINGS['ENABLE_TOOL_USE'] and ACTIVE_TOOL_DEFINITIONS:
+        help_text_parts.append("\n**I can also use tools like:**")
         for tool_def in ACTIVE_TOOL_DEFINITIONS:
             if tool_def["type"] == "function":
                 func_info = tool_def["function"]
@@ -2726,12 +2735,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
 
     if (
-        GROUP_FREE_WILL_ENABLED
+        SETTINGS['GROUP_FREE_WILL_ENABLED']
         and update.effective_chat
         and update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]
     ):
         help_text_parts.append(
-            f"\n*Group Free Will is enabled!* I might respond randomly about *{GROUP_FREE_WILL_PROBABILITY:.1%}* of the time, considering the last `~{GROUP_FREE_WILL_CONTEXT_MESSAGES}` messages in this specific topic/chat."
+            f"\n**Group Free Will is enabled!** I might respond randomly about **{SETTINGS['GROUP_FREE_WILL_PROBABILITY']:.1%}** of the time, considering the last `~{SETTINGS['GROUP_FREE_WILL_CONTEXT_MESSAGES']}` messages in this specific topic/chat."
         )
 
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
@@ -2791,7 +2800,7 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     raw_command_thread_id = update.message.message_thread_id
     effective_topic_id_for_command: Optional[int] = raw_command_thread_id
 
-    if update.effective_chat.is_forum and SEPARATE_TOPIC_HISTORIES:
+    if update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']:
         # For /newchat, the "context" it clears should match the message's apparent location.
         # If it's a reply to a "classic General" message, clear "General" history.
         if (
@@ -2815,7 +2824,7 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.debug(
                 f"/newchat: Command in specific topic. Effective Topic ID: {effective_topic_id_for_command}."
             )
-    elif not (update.effective_chat.is_forum and SEPARATE_TOPIC_HISTORIES):
+    elif not (update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']):
         # Not a forum or not separating, all context is 'general'
         effective_topic_id_for_command = None
         logger.debug(
@@ -2883,7 +2892,7 @@ async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # reply_text handles thread_id automatically
-    if not (BING_IMAGE_CREATOR_AVAILABLE and ImageGen and BING_AUTH_COOKIE):
+    if not (BING_IMAGE_CREATOR_AVAILABLE and ImageGen and SETTINGS['BING_AUTH_COOKIE']):
         await update.message.reply_text(
             "The /imagine command is currently unavailable or not configured. Please contact an admin."
         )
@@ -2928,7 +2937,7 @@ async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         image_gen = ImageGen(
-            auth_cookie=BING_AUTH_COOKIE
+            auth_cookie=SETTINGS['BING_AUTH_COOKIE']
         )  # Uses the global BING_AUTH_COOKIE
         image_links = await asyncio.to_thread(image_gen.get_images, prompt)
 
@@ -3018,42 +3027,27 @@ async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_bing_cookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
+    """(Owner-only) Sets the Bing Auth Cookie for the /imagine command."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+    if not BING_IMAGE_CREATOR_AVAILABLE:
+        await update.message.reply_text("Bing Image Creator is not installed on the server.")
         return
 
-    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
-        command_parts = update.message.text.split(" ", 1)
-        command_with_potential_mention = command_parts[0]
-        if (
-            "@" in command_with_potential_mention
-            and f"@{context.bot.username}" not in command_with_potential_mention
-        ):
-            logger.info(
-                f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring."
-            )
-            return
-
-    user_id_str = str(update.effective_user.id)
-    # Check admin and feature availability
-    if not (
-        BOT_OWNERS and user_id_str in BOT_OWNERS and BING_IMAGE_CREATOR_AVAILABLE
-    ):
-        await update.message.reply_text(
-            "This command is restricted to the bot owner or is currently unavailable."
-        )
-        return
     if not context.args or len(context.args) != 1:
         await update.message.reply_text("Usage: /setbingcookie <new_cookie_value>")
         return
 
     new_cookie = context.args[0]
-    global BING_AUTH_COOKIE
-    BING_AUTH_COOKIE = new_cookie
-    logger.info(f"BING_AUTH_COOKIE updated by admin: {user_id_str}")
-    # Reply handles thread ID
-    await update.message.reply_text(
-        "Bing authentication cookie has been updated for the /imagine command."
-    )
+    
+    # Update in-memory settings
+    SETTINGS['BING_AUTH_COOKIE'] = new_cookie
+    # Save to database
+    db_manager.set_setting('BING_AUTH_COOKIE', new_cookie)
+    
+    logger.info(f"BING_AUTH_COOKIE updated by owner: {update.effective_user.id}")
+    await update.message.reply_text("✅ Bing authentication cookie has been updated and saved.")
 
 
 async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3188,21 +3182,21 @@ async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message or not update.effective_user:
         return ConversationHandler.END
 
-    if not SHAPESINC_APP_ID:
+    if not SETTINGS['SHAPESINC_APP_ID']:
         await update.message.reply_text("The authentication feature is not configured by the bot admin (missing App ID).")
         return ConversationHandler.END # End the conversation
 
     # This part is the same as your old command
-    auth_url = f"https://shapes.inc/authorize?app_id={SHAPESINC_APP_ID}"
+    auth_url = f"https://shapes.inc/authorize?app_id={SETTINGS['SHAPESINC_APP_ID']}"
     reply_text = (
-        "*🔐 AUTHENTICATION PROCESS STARTED*\n"
+        "**🔐 AUTHENTICATION PROCESS STARTED**\n"
         "------------------------------------\n"
-        "*Step 1: Get Your Code* ➡️\n"
+        "**Step 1: Get Your Code** ➡️\n"
         "Click the link below. A new page will open and give you a one-time code.\n\n"
         f"[🔗 Authorize on Shapes.inc]({auth_url})\n"
         "------------------------------------\n"
-        "*Step 2: Send the Code Here* 🔢\n"
-        "Once you have the code, *paste it directly into this chat and press send*.\n\n"
+        "**Step 2: Send the Code Here** 🔢\n"
+        "Once you have the code, **paste it directly into this chat and press send**.\n\n"
         "_I am now waiting only for your code._\n"
         "_Type_ /cancel _to abort._"
     )
@@ -3231,8 +3225,8 @@ async def auth_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
             response = await client.post(
-                f"{SHAPES_AUTH_BASE_URL}/nonce",
-                json={"app_id": SHAPESINC_APP_ID, "code": one_time_code},
+                f"{SETTINGS['SHAPES_AUTH_BASE_URL']}/nonce",
+                json={"app_id": SETTINGS['SHAPESINC_APP_ID'], "code": one_time_code},
             )
             response.raise_for_status()
 
@@ -3266,6 +3260,110 @@ async def auth_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if update.message:
       await update.message.reply_text("Authentication process canceled.")
     return ConversationHandler.END
+
+async def set_perchance_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) Sets the Perchance API user key."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: /setperchancekey <new_key_value>")
+        return
+
+    new_key = context.args[0]
+    SETTINGS['PERCHANCE_USER_KEY'] = new_key
+    db_manager.set_setting('PERCHANCE_USER_KEY', new_key)
+    logger.info(f"PERCHANCE_USER_KEY updated by owner: {update.effective_user.id}")
+    await update.message.reply_text("✅ Perchance user key has been updated and saved.")
+
+async def view_settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) Displays the current bot settings, omitting sensitive values."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+
+    # A list of substrings that identify a key as sensitive
+    sensitive_key_fragments = ['TOKEN', 'API_KEY', 'COOKIE', 'APP_ID', 'USER_KEY']
+    
+    # Create a nice-looking list of settings
+    settings_text = ["*Current Bot Configuration (non-sensitive):*"]
+    hidden_count = 0
+
+    for key, value in sorted(SETTINGS.items()):
+        # Check if any sensitive fragment is in the key name
+        if any(fragment in key for fragment in sensitive_key_fragments):
+            hidden_count += 1
+            continue  # Skip this key and move to the next iteration
+
+        # This part will only run for non-sensitive keys
+        if isinstance(value, list) or isinstance(value, set):
+            display_value = f"`{', '.join(map(str, value)) or '[Empty]'}`"
+        else:
+            display_value = f"`{str(value)}`"
+        
+        settings_text.append(f"- *{key}*: {display_value}")
+
+    # Add a footer note to inform the user that some settings were hidden
+    if hidden_count > 0:
+        settings_text.append(f"\n_Note: {hidden_count} sensitive setting(s) were hidden._")
+
+    await send_telegramify_message(
+        context,
+        update.effective_chat.id,
+        "\n".join(settings_text),
+        update.message.message_thread_id
+    )
+
+async def set_setting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) A generic command to change any setting's value."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: /setsetting <SETTING_NAME> <new_value>\nExample: `/setsetting GROUP_FREE_WILL_PROBABILITY 0.1`")
+        return
+
+    key_to_set = context.args[0].upper()
+    new_value_str = " ".join(context.args[1:])
+
+    if key_to_set not in SETTINGS:
+        await update.message.reply_text(f"❌ Setting '{key_to_set}' not found.")
+        return
+    if any(sensitive in key_to_set for sensitive in ['TOKEN', 'API_KEY', 'COOKIE']):
+         await update.message.reply_text(f"❌ For security, you cannot change '{key_to_set}' with this command.")
+         return
+
+    # --- Apply the new setting ---
+    original_type = type(SETTINGS[key_to_set])
+    try:
+        if original_type == bool:
+            new_value = new_value_str.lower() in ['true', '1', 't', 'y', 'yes']
+        elif original_type == list or original_type == set:
+            new_value_list = [item.strip() for item in new_value_str.split(',') if item.strip()]
+            new_value = set(new_value_list) if original_type == set else new_value_list
+        else: # int, float, str
+            new_value = original_type(new_value_str)
+
+        # Update in-memory settings
+        SETTINGS[key_to_set] = new_value
+        # Save to DB (always as a string)
+        db_value_to_save = ','.join(map(str, new_value)) if isinstance(new_value, (list, set)) else str(new_value)
+        db_manager.set_setting(key_to_set, db_value_to_save)
+        
+        await update.message.reply_text(f"✅ Setting *{key_to_set}* has been updated to `{new_value}`.")
+        logger.info(f"Setting '{key_to_set}' changed to '{new_value}' by owner {update.effective_user.id}.")
+
+        # Special handling for ACTIVE_TOOLS
+        if key_to_set == 'ACTIVE_TOOLS':
+            # This logic needs to be run again to update the active tool definitions
+            rebuild_active_tool_lists()
+            await update.message.reply_text("ℹ️ Active tool definitions have been rebuilt.")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to set '{key_to_set}'. Error: {e}")
+        logger.error(f"Error setting '{key_to_set}': {e}")
+
 # --- END OF COMMAND HANDLERS ---
 
 # --- Main Message Handler ---
@@ -3276,7 +3374,7 @@ async def process_message_entrypoint(
         logger.debug("Update missing essential message, chat, or user. Ignoring.")
         return
 
-    if IGNORE_OLD_MESSAGES_ON_STARTUP and BOT_STARTUP_TIMESTAMP:
+    if SETTINGS['IGNORE_OLD_MESSAGES_ON_STARTUP'] and BOT_STARTUP_TIMESTAMP:
         message_date_utc = update.message.date.astimezone(dt_timezone.utc)
         if message_date_utc < BOT_STARTUP_TIMESTAMP:
             logger.info(
@@ -3295,7 +3393,7 @@ async def process_message_entrypoint(
     # None represents the "General" topic in forums or non-forum/non-separated contexts.
     effective_topic_context_id: Optional[int] = raw_current_message_thread_id
 
-    if update.effective_chat.is_forum and SEPARATE_TOPIC_HISTORIES:
+    if update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']:
         is_current_msg_topic_msg = update.message.is_topic_message # True if in a specific user-created topic
         is_reply_to_classic_general = (
             update.message.reply_to_message
@@ -3315,14 +3413,14 @@ async def process_message_entrypoint(
         # effective_topic_context_id remains raw_current_message_thread_id.
         # logger.debug(f"HISTORY CTX ID (Forum, Separated): Current msg in specific topic. Effective ID: {effective_topic_context_id}.")
 
-    elif not (update.effective_chat.is_forum and SEPARATE_TOPIC_HISTORIES):
+    elif not (update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']):
         # Not a forum or SEPARATE_TOPIC_HISTORIES is False. All context is "general" for this chat.
         effective_topic_context_id = None
         # logger.debug(f"HISTORY CTX ID (Not Forum or Not Separated): Effective ID: None. (Raw: {raw_current_message_thread_id})")
 
     logger.debug(
         f"Derived HISTORY/CONTEXT ID: {effective_topic_context_id} "
-        f"(Raw incoming thread_id: {raw_current_message_thread_id}, is_forum: {update.effective_chat.is_forum}, separate_hist: {SEPARATE_TOPIC_HISTORIES})"
+        f"(Raw incoming thread_id: {raw_current_message_thread_id}, is_forum: {update.effective_chat.is_forum}, separate_hist: {SETTINGS['SEPARATE_TOPIC_HISTORIES']})"
     )
 
     # --- Determine effective_send_thread_id for SENDING REPLIES ---
@@ -3351,7 +3449,7 @@ async def process_message_entrypoint(
 
     # --- Lock Key based on effective_topic_context_id ---
     lock_key: Union[int, Tuple[int, Optional[int]]]
-    if update.effective_chat.is_forum and SEPARATE_TOPIC_HISTORIES:
+    if update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']:
         lock_key = (chat_id, effective_topic_context_id)
     else:
         lock_key = chat_id
@@ -3434,8 +3532,8 @@ async def process_message_entrypoint(
                 elif bot_username_at in text_for_trigger_check:
                     should_process_message, is_mention_to_bot = True, True
                 elif (
-                    GROUP_FREE_WILL_ENABLED
-                    and random.random() < GROUP_FREE_WILL_PROBABILITY
+                    SETTINGS['GROUP_FREE_WILL_ENABLED']
+                    and random.random() < SETTINGS['GROUP_FREE_WILL_PROBABILITY']
                 ):
                     should_process_message, is_free_will_triggered = True, True
 
@@ -3508,8 +3606,8 @@ async def process_message_entrypoint(
                 base_text_for_llm = format_freewill_context_from_raw_log(
                     chat_id,
                     effective_topic_context_id,
-                    GROUP_FREE_WILL_CONTEXT_MESSAGES,
-                    context.bot.username or SHAPESINC_SHAPE_USERNAME,
+                    SETTINGS['GROUP_FREE_WILL_CONTEXT_MESSAGES'],
+                    context.bot.username or SETTINGS['SHAPESINC_SHAPE_USERNAME'],
                     update.effective_chat.title,
                     known_topic_name_for_context,
                     replied_to_message_context=replied_to_info,
@@ -3753,12 +3851,12 @@ async def process_message_entrypoint(
                         last_message_turn = [llm_history[-1]] if llm_history else []
 
                         api_params: Dict[str, Any] = {
-                            "model": f"shapesinc/{SHAPESINC_SHAPE_USERNAME}",
+                            "model": f"shapesinc/{SETTINGS['SHAPESINC_SHAPE_USERNAME']}",
                             "messages": last_message_turn,
                         }
 
                         if (
-                            ENABLE_TOOL_USE
+                            SETTINGS['ENABLE_TOOL_USE']
                             and ACTIVE_TOOL_DEFINITIONS
                             and not is_free_will_triggered
                         ):
@@ -3774,7 +3872,7 @@ async def process_message_entrypoint(
                             api_params.pop("tool_choice", None)
 
                         channel_id_for_api: str
-                        if update.effective_chat.is_forum and SEPARATE_TOPIC_HISTORIES:
+                        if update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']:
                             if effective_topic_context_id is not None:
                                 channel_id_for_api = (
                                     f"{chat_id}_{effective_topic_context_id}"
@@ -3792,10 +3890,10 @@ async def process_message_entrypoint(
                             logger.info(f"User {current_user.id} has an auth token. Using user-authenticated client.")
                             client_for_this_request = AsyncOpenAI(
                                 api_key="not-needed",
-                                base_url=SHAPES_API_BASE_URL,
+                                base_url=SETTINGS['SHAPES_API_BASE_URL'],
                                 timeout=SHAPES_API_CLIENT_TIMEOUT,
                                 default_headers={
-                                    "X-App-ID": SHAPESINC_APP_ID,
+                                    "X-App-ID": SETTINGS['SHAPESINC_APP_ID'],
                                     "X-User-Auth": user_auth_tokens[current_user.id],
                                     "X-Channel-Id": channel_id_for_api,
                                 },
@@ -3826,7 +3924,7 @@ async def process_message_entrypoint(
                         )
 
                         if ai_msg_obj.tool_calls:
-                            if not ENABLE_TOOL_USE or is_free_will_triggered:
+                            if not SETTINGS['ENABLE_TOOL_USE'] or is_free_will_triggered:
                                 text_from_this_iteration = "I tried to use a tool, but it's disabled for this action."
                                 logger.warning(
                                     f"Chat {chat_id}: AI tool use attempt when disabled. Calls: {ai_msg_obj.tool_calls}"
@@ -4004,7 +4102,7 @@ async def process_message_entrypoint(
                     ).strip()
 
                     if (
-                        not text_part_after_media_extraction.strip()
+                        (not text_part_after_media_extraction.strip() or text_part_after_media_extraction.strip().lower() == "ext")
                         and not image_urls_to_send
                         and not audio_urls_to_send
                     ):
@@ -4318,10 +4416,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Determine owner chat ID for notification
     chat_id_to_notify_owner: Optional[int] = None
-    if NOTIFY_OWNER_ON_ERROR and BOT_OWNERS:  # Check if notifications are enabled AND owners are set
+    if SETTINGS['NOTIFY_OWNER_ON_ERROR'] and SETTINGS['BOT_OWNERS']:  # Check if notifications are enabled AND owners are set
         try:
             chat_id_to_notify_owner = int(
-                BOT_OWNERS[0]
+                SETTINGS['BOT_OWNERS'][0]
             )  # Attempt to get the first owner's user ID
         except (ValueError, IndexError, TypeError):
             logger.error(
@@ -4472,17 +4570,24 @@ async def post_initialization(application: Application) -> None:
         BotCommand("auth_shapes", "Connect your Shapes.inc account."),
     ]
     if (
-        BING_IMAGE_CREATOR_AVAILABLE and BING_AUTH_COOKIE
+        BING_IMAGE_CREATOR_AVAILABLE and SETTINGS['BING_AUTH_COOKIE']
     ):  # Only show /imagine if fully configured
         bot_commands.append(
             BotCommand("imagine", "Generate images from a prompt (Bing).")
         )
 
-    # setbingcookie is an admin command, only show if BING is available and there are owners
-    if BING_IMAGE_CREATOR_AVAILABLE and BOT_OWNERS:
-        bot_commands.append(
-            BotCommand("setbingcookie", "(Owner) Update Bing auth cookie.")
-        )
+    # Add owner-specific commands to the list if owners are defined
+    if SETTINGS.get('BOT_OWNERS'):
+        bot_commands.extend([
+            BotCommand("viewsettings", "(Owner) View current bot settings."),
+            BotCommand("setsetting", "(Owner) Change a bot setting."),
+            BotCommand("setperchancekey", "(Owner) Set the Perchance API key.")
+        ])
+        # setbingcookie is an admin command, only show if BING is available and there are owners
+        if BING_IMAGE_CREATOR_AVAILABLE:
+            bot_commands.append(
+                BotCommand("setbingcookie", "(Owner) Update Bing auth cookie.")
+            )
 
     try:
         await application.bot.set_my_commands(bot_commands)
@@ -4495,37 +4600,74 @@ async def post_initialization(application: Application) -> None:
 
 if __name__ == "__main__":
 
-    # Get the DB path
-    DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_database.db")
+    # --- Load settings from .env as defaults ---
+    load_settings()
 
-    # Ensure the directory for the database exists inside the container
+    # --- Initialize Database and override settings from DB ---
+    DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_database.db")
     db_directory = os.path.dirname(DATABASE_PATH)
     if db_directory:
         os.makedirs(db_directory, exist_ok=True)
-
-    # Initialize the Database Manager with the specified path
     db_manager = DatabaseManager(DATABASE_PATH)
+    override_settings_from_db(db_manager) # This applies DB values over .env defaults
+
+    # --- Validate Critical Settings & Initialize Clients ---
+    if not SETTINGS.get('TELEGRAM_TOKEN'):
+        raise ValueError("BOT_TOKEN not set in environment or database.")
+    if not SETTINGS.get('SHAPESINC_API_KEY'):
+        raise ValueError("SHAPESINC_API_KEY not set in environment or database.")
+    if not SETTINGS.get('SHAPESINC_SHAPE_USERNAME'):
+        raise ValueError("SHAPESINC_SHAPE_USERNAME not set in environment or database.")
     
-    # Load all persistent state into in-memory caches for fast access
-    user_auth_tokens = db_manager.load_all_user_tokens()
+    try:
+        aclient_shape = AsyncOpenAI(
+            api_key=SETTINGS['SHAPESINC_API_KEY'],
+            base_url=SETTINGS['SHAPES_API_BASE_URL'],
+            timeout=SHAPES_API_CLIENT_TIMEOUT,
+        )
+        logger.info(
+            f"Shapes client init: {SETTINGS['SHAPESINC_SHAPE_USERNAME']} at {SETTINGS['SHAPES_API_BASE_URL']}"
+        )
+        logger.info(f"Tool use: {'ENABLED' if SETTINGS['ENABLE_TOOL_USE'] else 'DISABLED'}.")
+        if SETTINGS['GROUP_FREE_WILL_ENABLED']:
+            logger.info(
+                f"Group Free Will: ENABLED with probability {SETTINGS['GROUP_FREE_WILL_PROBABILITY']:.2%} and context of {SETTINGS['GROUP_FREE_WILL_CONTEXT_MESSAGES']} messages."
+            )
+        else:
+            logger.info("Group Free Will: DISABLED.")
+
+        logger.info(
+            f"Separate Topic Histories: {'ENABLED' if SETTINGS['SEPARATE_TOPIC_HISTORIES'] else 'DISABLED'}"
+        )
+        logger.info(
+            f"Ignore old messages on startup: {'ENABLED' if SETTINGS['IGNORE_OLD_MESSAGES_ON_STARTUP'] else 'DISABLED'}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to init Shapes client: {e}")
+        raise
+
+    # --- Load other persistent data ---
+    # This dictionary is now just a cache, loaded from the DB at startup
+    user_auth_tokens: Dict[int, str] = db_manager.load_all_user_tokens()
     chat_histories = db_manager.load_all_histories()
     activated_chats_topics = db_manager.load_all_activated_topics()
 
-    logger.info(f"Loaded {len(user_auth_tokens)} user tokens from DB.")
-    logger.info(f"Loaded {len(chat_histories)} conversation histories from DB.")
-    logger.info(f"Loaded {len(activated_chats_topics)} activated topics from DB.")
+    logger.info(f"Loaded {len(user_auth_tokens)} user tokens, {len(chat_histories)} histories, {len(activated_chats_topics)} activations.")
+    
+    # Rebuild tool lists based on final settings
+    rebuild_active_tool_lists()
 
     # Record bot startup time (UTC)
     BOT_STARTUP_TIMESTAMP = datetime.now(dt_timezone.utc)
     logger.info(f"Bot starting up at: {BOT_STARTUP_TIMESTAMP}")
-    if IGNORE_OLD_MESSAGES_ON_STARTUP:
+    if SETTINGS['IGNORE_OLD_MESSAGES_ON_STARTUP']:
         logger.info("Bot will ignore messages received before this startup time.")
 
     # Increase timeouts for network requests, especially for sending files
     # Default is 5s, which is too short for uploads. We'll set a longer read/write timeout.
     app_builder = (
         ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
+        .token(SETTINGS['TELEGRAM_TOKEN'])
         .concurrent_updates(True)
         .connect_timeout(10.0)
         .read_timeout(60.0)
@@ -4558,11 +4700,14 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("newchat", new_chat_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("deactivate", deactivate_command))
+    app.add_handler(CommandHandler("setperchancekey", set_perchance_key_command))
+    app.add_handler(CommandHandler("viewsettings", view_settings_command))
+    app.add_handler(CommandHandler("setsetting", set_setting_command))
     app.add_handler(auth_conv_handler)
     # Only add imagine/setbingcookie if library is available
     if BING_IMAGE_CREATOR_AVAILABLE:
         # Only add /imagine if cookie is also set initially
-        if BING_AUTH_COOKIE:
+        if SETTINGS['BING_AUTH_COOKIE']:
             app.add_handler(CommandHandler("imagine", imagine_command))
         # Admin can set cookie even if not initially present
         app.add_handler(CommandHandler("setbingcookie", set_bing_cookie_command))
