@@ -2743,6 +2743,7 @@ async def _process_media_and_documents(
             # --- Handling for Animated Stickers (.tgs) ---
             if message.sticker.is_animated:
                 has_image = True
+                appended_text += "\n\n[INFO: The attached image(s) are frames from an animated sticker that was sent.]"
                 logger.info(f"Chat {chat_id}: Processing animated sticker (.tgs) using the safe render_pillow_frame method.")
                 try:
                     sticker_file = await message.sticker.get_file()
@@ -2776,6 +2777,7 @@ async def _process_media_and_documents(
             # --- Handling for Video Stickers (.webm) ---
             elif message.sticker.is_video:
                 has_image = True
+                appended_text += "\n\n[INFO: The attached image(s) are frames from a video sticker that was sent.]"
                 logger.info(f"Chat {chat_id}: Processing video sticker (.webm).")
                 temp_video_path = None
                 cap = None
@@ -2811,6 +2813,7 @@ async def _process_media_and_documents(
             # --- Handling for Static Stickers (.webp) ---
             else:
                 has_image = True
+                appended_text += "\n\n[INFO: The attached image is from a static sticker that was sent.]"
                 sticker_file = await message.sticker.get_file()
                 file_bytes = await sticker_file.download_as_bytearray()
                 base64_image = base64.b64encode(file_bytes).decode("utf-8")
@@ -2842,6 +2845,7 @@ async def _process_media_and_documents(
             appended_text += f"\n\n[INFO: An attached animation '{anim_name}' was ignored because it is too large.]"
         else:
             has_image = True
+            appended_text += f"\n\n[INFO: The attached image(s) are frames from a GIF animation named '{anim_name}' that was sent.]"
             logger.info(f"Chat {chat_id}: Processing Animation object '{anim_name}'.")
             temp_video_path = None
             cap = None
@@ -2882,6 +2886,7 @@ async def _process_media_and_documents(
             appended_text += f"\n\n[INFO: An attached video '{video_name}' was ignored because it is too large.]"
         else:
             has_image = True # We are processing it into image frames
+            appended_text += f"\n\n[INFO: The attached image(s) are frames from a video named '{video_name}' that was sent.]"
             logger.info(f"Chat {chat_id}: Processing Video object '{video_name}'.")
             temp_video_path = None
             cap = None
@@ -2928,6 +2933,7 @@ async def _process_media_and_documents(
                 appended_text += f"\n\n[INFO: An attached GIF file '{doc_name}' was ignored because it is too large.]"
             else:
                 has_image = True
+                appended_text += f"\n\n[INFO: The attached image(s) are frames from a GIF file named '{doc_name}' that was sent.]"
                 logger.info(f"Chat {chat_id}: Processing GIF document '{doc_name}'.")
                 try:
                     file_bytes = await (await doc.get_file()).download_as_bytearray()
