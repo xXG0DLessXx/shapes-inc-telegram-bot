@@ -1,34 +1,35 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-alpine
-
-# Set environment variables for Python
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Set the working directory in the container
+# builder stage
+FROM python:3.11-alpine AS builder
 WORKDIR /app
 
-# Install system dependencies that might be needed by some Python packages (e.g., for image processing)
-# Add any other build-time dependencies here if needed by your Python packages
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#     build-essential \
-#  && rm -rf /var/lib/apt/lists/*
+# System dependencies for building Python packages
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    make \
+    ninja \
+    linux-headers \
+    ffmpeg-dev
 
-# Copy the requirements file into the container
 COPY requirements.txt .
-
-# Install Python dependencies
-# Using --no-cache-dir to reduce image size
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code into the container
+# --- Final Stage ---
+FROM python:3.11-alpine
+
+# System dependencies for running the application
+RUN apk add --no-cache \
+    ffmpeg-libs \
+    libjpeg-turbo \
+    libpng \
+    tiff
+
+WORKDIR /app
+
+# Copy installed python packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+
+# Copy application code
 COPY bot.py .
-# If you have other local modules or files (e.g. a "utils" folder), copy them too:
-# COPY utils/ ./utils/
 
-# Expose the port the app runs on (not strictly necessary for polling bots, but good practice if you ever switch to webhooks)
-# EXPOSE 8080 # Or whatever port your webhook might use
-
-# Command to run the application
-# The environment variables (BOT_TOKEN, etc.) will be passed in via docker-compose.yml or `docker run -e`
 CMD ["python", "bot.py"]

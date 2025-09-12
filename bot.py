@@ -6,6 +6,7 @@ import shutil
 import base64
 import mimetypes
 import asyncio
+import time
 import re  # For sanitization and new markdown, and calculator tool
 # telegramify_markdown for advanced message formatting
 import telegramify_markdown
@@ -13,28 +14,36 @@ from telegramify_markdown.type import ContentTypes
 from telegramify_markdown.interpreters import (
     TextInterpreter, FileInterpreter, MermaidInterpreter, InterpreterChain
 )
+
 import traceback  # For detailed error handler
 import html  # For detailed error handler
 import httpx  # For specific exception types
 from dotenv import load_dotenv
 from typing import Dict, List, Tuple, Optional, Set, Union, Any
 
-# New imports for additional tools
+# Imports for additional tools
 import math
 from datetime import (
     datetime,
     timedelta,
     timezone as dt_timezone,
-)  # Added timezone for startup timestamp
+)  # Timezone for startup timestamp
 import pytz
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs, unquote as url_unquote
 
-# New imports for document handling
-import docx  # Add this line if missing
-from odf import text, teletype  # Add this line if missing
-from odf.opendocument import load as odf_load  # Add this line if missing
-from io import BytesIO  # Add this line if missing
+# Imports for document handling
+import docx
+from odf import text, teletype
+from odf.opendocument import load as odf_load
+from io import BytesIO
+
+# Imports for gif/video sticker handling
+import gzip
+from PIL import Image
+from rlottie_python import LottieAnimation
+import cv2
+import numpy as np
 
 # Telegram imports
 from telegram import (
@@ -65,7 +74,7 @@ from openai import (
     AsyncOpenAI,
     InternalServerError,
     APITimeoutError,
-)  # Added InternalServerError, APITimeoutError
+)  # InternalServerError, APITimeoutError
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
@@ -109,6 +118,39 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ignored_users (
+                user_id INTEGER PRIMARY KEY,
+                ignored_until TIMESTAMP NOT NULL,
+                reason TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS message_stats (
+                stat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                chat_title TEXT,
+                user_id INTEGER NOT NULL,
+                message_timestamp TIMESTAMP NOT NULL,
+                is_outgoing BOOLEAN NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS llm_stats (
+                stat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP NOT NULL,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                model_name TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                was_tool_call BOOLEAN NOT NULL,
+                request_duration_ms INTEGER NOT NULL,
+                is_premium BOOLEAN NOT NULL DEFAULT 0, 
+                fallback_used BOOLEAN NOT NULL DEFAULT 0
             )
         """)
         self.conn.commit()
@@ -200,6 +242,152 @@ class DatabaseManager:
         """Loads all settings from the bot_settings table into a dictionary."""
         cursor = self.conn.execute("SELECT key, value FROM bot_settings")
         return {row['key']: row['value'] for row in cursor.fetchall()}
+
+    # Ignore User Management
+    def add_ignored_user(self, user_id: int, until: datetime, reason: Optional[str]):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ignored_users (user_id, ignored_until, reason) VALUES (?, ?, ?)",
+            (user_id, until, reason)
+        )
+        self.conn.commit()
+
+    def remove_ignored_user(self, user_id: int):
+        self.conn.execute("DELETE FROM ignored_users WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+
+    def load_all_ignored_users(self) -> Dict[int, Dict[str, Any]]:
+        cursor = self.conn.execute("SELECT user_id, ignored_until, reason FROM ignored_users")
+        # Parse the datetime string from the database
+        return {
+            row['user_id']: {
+                'ignored_until': datetime.fromisoformat(row['ignored_until']),
+                'reason': row['reason']
+            }
+            for row in cursor.fetchall()
+        }
+
+    # Statistics Management
+    def log_message(self, chat_id: int, chat_title: Optional[str], user_id: int, is_outgoing: bool):
+        self.conn.execute(
+            "INSERT INTO message_stats (chat_id, chat_title, user_id, message_timestamp, is_outgoing) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, chat_title, user_id, datetime.now(dt_timezone.utc), is_outgoing)
+        )
+        self.conn.commit()
+    
+    # --- Method for LLM stats ---
+    def log_llm_request(
+        self, chat_id: int, user_id: int, model: str, usage: dict,
+        was_tool_call: bool, duration_ms: int, is_premium: bool, fallback_used: bool
+    ):
+        """Logs the details of a completed LLM API call."""
+        self.conn.execute(
+            """
+            INSERT INTO llm_stats (
+                timestamp, chat_id, user_id, model_name, prompt_tokens,
+                completion_tokens, total_tokens, was_tool_call, request_duration_ms,
+                is_premium, fallback_used 
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(dt_timezone.utc),
+                chat_id,
+                user_id,
+                model,
+                usage.get('prompt_tokens', 0),
+                usage.get('completion_tokens', 0),
+                usage.get('total_tokens', 0),
+                was_tool_call,
+                duration_ms,
+                is_premium,
+                fallback_used
+            )
+        )
+        self.conn.commit()
+
+    # --- Method to get LLM stats ---
+    def get_llm_stats(self) -> Dict[str, Any]:
+        """Retrieves aggregated LLM API usage statistics."""
+        cursor = self.conn.cursor()
+
+        # All-time token counts
+        cursor.execute("SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens) FROM llm_stats")
+        tokens = cursor.fetchone()
+
+        # Last and most used model
+        cursor.execute("SELECT model_name FROM llm_stats ORDER BY timestamp DESC LIMIT 1")
+        last_model = cursor.fetchone()
+
+        cursor.execute("""
+            SELECT model_name, COUNT(model_name) as model_count
+            FROM llm_stats
+            GROUP BY model_name
+            ORDER BY model_count DESC
+            LIMIT 1
+        """)
+        most_used_model = cursor.fetchone()
+
+        # Total API calls and tool uses
+        cursor.execute("SELECT COUNT(*) FROM llm_stats")
+        total_calls = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM llm_stats WHERE was_tool_call = 1")
+        tool_calls = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM llm_stats WHERE is_premium = 1")
+        premium_sessions = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM llm_stats WHERE fallback_used = 1")
+        fallback_sessions = cursor.fetchone()[0]
+
+        return {
+            "total_prompt_tokens": tokens[0] if tokens else 0,
+            "total_completion_tokens": tokens[1] if tokens else 0,
+            "total_tokens": tokens[2] if tokens else 0,
+            "last_model_used": last_model[0] if last_model else "N/A",
+            "most_used_model": f"{most_used_model[0]} ({most_used_model[1]} times)" if most_used_model else "N/A",
+            "total_api_calls": total_calls or 0,
+            "total_tool_uses": tool_calls or 0,
+            "premium_sessions": premium_sessions or 0,
+            "fallback_sessions": fallback_sessions or 0,
+        }
+
+    def get_stats(self) -> Dict[str, Any]:
+        cursor = self.conn.cursor()
+        
+        # All-time unique users and groups
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM message_stats")
+        total_users = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(DISTINCT chat_id) FROM message_stats WHERE chat_id < 0")
+        total_groups = cursor.fetchone()[0]
+
+        # Stats for the last 30 days
+        thirty_days_ago = datetime.now(dt_timezone.utc) - timedelta(days=30)
+        
+        cursor.execute(
+            "SELECT is_outgoing, COUNT(*) FROM message_stats WHERE message_timestamp >= ? GROUP BY is_outgoing",
+            (thirty_days_ago,)
+        )
+        message_counts = dict(cursor.fetchall())
+
+        cursor.execute(
+            """
+            SELECT chat_title, COUNT(*) as msg_count
+            FROM message_stats
+            WHERE message_timestamp >= ? AND chat_id < 0 AND chat_title IS NOT NULL
+            GROUP BY chat_id, chat_title
+            ORDER BY msg_count DESC
+            LIMIT 5
+            """,
+            (thirty_days_ago,)
+        )
+        top_groups = cursor.fetchall()
+
+        return {
+            "total_unique_users": total_users or 0,
+            "total_groups": total_groups or 0,
+            "messages_received_30d": message_counts.get(False, 0),
+            "messages_sent_30d": message_counts.get(True, 0),
+            "top_groups_30d": [{"title": row[0], "count": row[1]} for row in top_groups]
+        }
 
     def close(self):
         """Closes the database connection."""
@@ -315,6 +503,7 @@ chat_histories: dict[tuple[int, Optional[int]], list[ChatCompletionMessageParam]
 # The key is either a chat_id (int) or a (chat_id, thread_id) tuple.
 processing_locks: Dict[Union[int, Tuple[int, Optional[int]]], asyncio.Lock] = {}
 MAX_TEXT_FILE_SIZE = 500 * 1024  # 500 KB limit for text files
+MAX_IMAGE_FILE_SIZE = 10 * 1024 * 1024 # 10 MB limit for images/animations
 MAX_HISTORY_LENGTH = 10
 # Stores raw messages (sender/text) per group chat_id and thread_id for free will context
 group_raw_message_log: Dict[int, Dict[Optional[int], List[Dict[str, str]]]] = {}
@@ -325,6 +514,14 @@ activated_chats_topics: Set[Tuple[int, Optional[int]]] = set()
 topic_names_cache: Dict[Tuple[int, int], str] = {}  # (chat_id, thread_id) -> topic_name
 MAX_TOPIC_ENTRIES_PER_CHAT_IN_CACHE = 200
 chat_topic_cache_keys_order: Dict[int, List[Tuple[int, int]]] = {}
+
+# In-memory cache for ignored users for performance
+ignored_users_cache: Dict[int, Dict[str, Any]] = {}
+
+# Cache for incoming media group messages, keyed by media_group_id
+# Format: { "media_group_id": [Message, Message, ...] }
+media_group_cache: Dict[str, List[TelegramMessage]] = {}
+media_group_lock = asyncio.Lock()
 # --- END OF Global Config & Setup ---
 
 # --- HELPER FUNCTION for sending messages with thread fallback ---
@@ -547,7 +744,7 @@ async def create_poll_tool(
     # Parameters to be passed by the main handler:
     telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
     current_chat_id: Optional[int] = None,
-    current_message_thread_id: Optional[int] = None,  # Added thread ID
+    current_message_thread_id: Optional[int] = None,
 ) -> str:
     logger.info(
         f"TOOL: create_poll_tool for chat_id {current_chat_id} (thread_id: {current_message_thread_id}) with question='{question}', options={options}"
@@ -1713,6 +1910,90 @@ async def get_user_info_tool(
         )
         return json.dumps({"error": "An unexpected internal error occurred."})
 
+# Tool to get chat information
+async def get_chat_info_tool(
+    telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+    current_chat_id: Optional[int] = None,
+) -> str:
+    """Retrieves information about the current chat, such as title and member count."""
+    if not telegram_bot_context or not current_chat_id:
+        return json.dumps({"error": "Internal error: Context or Chat ID not provided."})
+    
+    bot = telegram_bot_context.bot
+    logger.info(f"TOOL: get_chat_info for chat {current_chat_id}")
+
+    try:
+        chat_info = await bot.get_chat(current_chat_id)
+        member_count = await bot.get_chat_member_count(current_chat_id)
+
+        result = {
+            "status": "success",
+            "chat_info": {
+                "id": chat_info.id,
+                "title": chat_info.title,
+                "type": chat_info.type,
+                "description": chat_info.description,
+                "member_count": member_count
+            }
+        }
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error in get_chat_info_tool for chat {current_chat_id}: {e}")
+        return json.dumps({"status": "failed", "error": f"Telegram API error: {e}"})
+
+# Tool to manage ignored (blocked) users
+async def manage_ignored_user_tool(
+    user_id: int,
+    action: str,
+    duration: Optional[str] = "24h",
+    reason: Optional[str] = None,
+    telegram_bot_context: Optional[ContextTypes.DEFAULT_TYPE] = None
+) -> str:
+    """Blocks a user from interacting with the bot for a specified duration (max 24h), or unblocks them."""
+    if not telegram_bot_context:
+         return json.dumps({"error": "Internal error: Bot context not provided."})
+         
+    logger.info(f"TOOL: manage_ignored_user for user {user_id}, action: {action}, duration: {duration}")
+
+    # Safety checks
+    if user_id == telegram_bot_context.bot.id:
+        return json.dumps({"status": "failed", "error": "Action failed: I cannot ignore myself."})
+    if str(user_id) in SETTINGS.get('BOT_OWNERS', []):
+        return json.dumps({"status": "failed", "error": "Action failed: I cannot ignore an Admin."})
+
+    if action.lower() == "block" or action.lower() == "ignore":
+        try:
+            ignore_timedelta = _parse_duration(duration)
+            # Enforce 24-hour maximum duration
+            if ignore_timedelta > timedelta(hours=24):
+                ignore_timedelta = timedelta(hours=24)
+                reason_suffix = " (duration capped at 24 hours)."
+            else:
+                reason_suffix = "."
+            
+            until_date = datetime.now(dt_timezone.utc) + ignore_timedelta
+            
+            # Update cache and database
+            ignored_users_cache[user_id] = {'ignored_until': until_date, 'reason': reason}
+            db_manager.add_ignored_user(user_id, until_date, reason)
+
+            success_message = f"User {user_id} has been ignored until {until_date.isoformat()}" + reason_suffix
+            return json.dumps({"status": "success", "details": success_message})
+            
+        except ValueError as e:
+            return json.dumps({"status": "failed", "error": str(e)})
+
+    elif action.lower() == "unblock" or action.lower() == "unignore":
+        if user_id in ignored_users_cache:
+            ignored_users_cache.pop(user_id, None)
+            db_manager.remove_ignored_user(user_id)
+            return json.dumps({"status": "success", "details": f"User {user_id} has been un-ignored."})
+        else:
+            return json.dumps({"status": "not_found", "details": f"User {user_id} was not on the ignore list."})
+    else:
+        return json.dumps({"status": "failed", "error": "Invalid action. Use 'block' or 'unblock'."})
+
 
 ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
     "calculator": calculator_tool,
@@ -1722,6 +2003,8 @@ ALL_AVAILABLE_TOOLS_PYTHON_FUNCTIONS = {
     "get_game_deals": get_game_deals_tool,
     "restrict_user_in_chat": restrict_user_in_chat_tool,
     "get_user_info": get_user_info_tool,
+    "get_chat_info": get_chat_info_tool,
+    "manage_ignored_user": manage_ignored_user_tool,
     "generate_anime_image": generate_anime_image_tool,
 }
 
@@ -1952,6 +2235,45 @@ ALL_TOOL_DEFINITIONS_FOR_API: list[ChatCompletionToolParam] = [
     {
         "type": "function",
         "function": {
+            "name": "get_chat_info",
+            "description": "Retrieves information about the current chat, such as its title, type, and approximate member count. Useful for understanding the context of a group conversation.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_ignored_user",
+            "description": "Blocks a user from interacting with the bot for a specified duration (max 24h), or unblocks them. Blocked users' messages will be ignored completely. This is action affects even private messages, unlike muting which only affects the current group chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "integer",
+                        "description": "The unique integer ID of the user to block or unblock.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "The action to perform: 'block' (or 'ignore') or 'unblock' (or 'unignore').",
+                        "enum": ["block", "unblock", "ignore", "unignore"],
+                    },
+                    "duration": {
+                        "type": "string",
+                        "description": "For 'block' action, the duration for the block. E.g., '30m', '5h', '1d'. Max is '24h' or '1d'. Defaults to '24h'.",
+                        "default": "24h",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional. The reason for blocking the user.",
+                    },
+                },
+                "required": ["user_id", "action"],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_anime_image",
             "description": "Generates a high-quality, anime-style image based on a descriptive prompt. Use this to create visual representations of scenes, characters, or concepts in an anime art style. Depictions of violence, sex, and other NSFW content is allowed, there is no filter.",
             "parameters": {
@@ -2105,6 +2427,22 @@ def is_user_or_chat_allowed(user_id: int, chat_id: int) -> bool:
         return True
     return False
 
+# Helper to check if a user is currently ignored
+def is_user_ignored(user_id: int) -> bool:
+    """Checks the in-memory cache to see if a user is currently ignored."""
+    ignore_info = ignored_users_cache.get(user_id)
+    if not ignore_info:
+        return False
+    
+    # Check if the ignore period has expired
+    if datetime.now(dt_timezone.utc) > ignore_info['ignored_until']:
+        logger.info(f"Ignore period for user {user_id} has expired. Removing from cache and DB.")
+        # Clean up expired entry
+        ignored_users_cache.pop(user_id, None)
+        db_manager.remove_ignored_user(user_id)
+        return False
+        
+    return True
 
 async def handle_permission_denied(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
@@ -2209,7 +2547,7 @@ def format_freewill_context_from_raw_log(
     elif (
         current_chat_title
     ):  # In a group, but not a specific topic (i.e., the "General" area of a group with topics)
-        location_description_parts.append("the general chat area")
+        location_description_parts.append("in the general chat area")
 
     # Default if no parts (e.g., private chat without title, or unexpected scenario)
     topic_desc_log = (
@@ -2367,58 +2705,121 @@ async def _process_media_and_documents(
 ) -> tuple[bool, bool, str, list[dict[str, Any]]]:
     """
     Processes photos, voice, and documents from a message.
-    Returns a tuple of (has_image, has_voice, appended_text_from_files, media_parts_list).
+    Handles all media types including static photos, all sticker types (static, animated, video),
+    GIFs, voice messages, and various text/document formats.
+    Includes file size checks to avoid excessive memory usage.
     """
     has_image = False
     has_voice = False
     appended_text = ""
-    media_parts = []  # Create a local list
+    media_parts: List[Dict[str, Any]] = []
     chat_id = message.chat_id
+    MAX_ANIMATION_FRAMES = 5  # Limit frames for all animation types to avoid spamming the API
 
     # 1. Process standard Photo object
     if message.photo:
-        has_image = True
-        photo_file = await message.photo[-1].get_file()
-        file_bytes = await photo_file.download_as_bytearray()
-        base64_image = base64.b64encode(file_bytes).decode("utf-8")
-        mime_type = (
-            mimetypes.guess_type(photo_file.file_path or "img.jpg")[0] or "image/jpeg"
-        )
-        media_parts.append(
-            {
+        photo = message.photo[-1]
+        if photo.file_size and photo.file_size > MAX_IMAGE_FILE_SIZE:
+            logger.warning(f"Chat {chat_id}: Ignoring photo ({(photo.file_size / 1024 / 1024):.2f} MB) due to size limit.")
+            appended_text += "\n\n[INFO: An attached photo was ignored because it is too large.]"
+        else:
+            has_image = True
+            photo_file = await photo.get_file()
+            file_bytes = await photo_file.download_as_bytearray()
+            base64_image = base64.b64encode(file_bytes).decode("utf-8")
+            mime_type = mimetypes.guess_type(photo_file.file_path or "img.jpg")[0] or "image/jpeg"
+            media_parts.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
-            }
-        )
-        logger.info(f"Chat {chat_id}: Added image_url from photo object.")
+            })
+            logger.info(f"Chat {chat_id}: Added image_url from standard photo object.")
 
-    # 1.5 Process Sticker object (as an image)
+    # 1.5 Process Sticker object (ALL TYPES)
     if message.sticker:
-        # We can only process static stickers (like .webp), not animated (.tgs) or video (.webm) ones.
-        if not message.sticker.is_animated and not message.sticker.is_video:
-            has_image = True
-            sticker_file = await message.sticker.get_file()
-            file_bytes = await sticker_file.download_as_bytearray()
-            base64_image = base64.b64encode(file_bytes).decode("utf-8")
-            # Stickers are often in webp format, which vision models can handle.
-            mime_type = (
-                mimetypes.guess_type(sticker_file.file_path or "sticker.webp")[0]
-                or "image/webp"
-            )
-            media_parts.append(
-                {
+        if message.sticker.file_size and message.sticker.file_size > MAX_IMAGE_FILE_SIZE:
+            logger.warning(f"Chat {chat_id}: Ignoring sticker ({(message.sticker.file_size / 1024 / 1024):.2f} MB) due to size limit.")
+            appended_text += "\n\n[INFO: An attached sticker was ignored because it is too large.]"
+        else:
+            # --- Handling for Animated Stickers (.tgs) ---
+            if message.sticker.is_animated:
+                has_image = True
+                logger.info(f"Chat {chat_id}: Processing animated sticker (.tgs) using the safe render_pillow_frame method.")
+                try:
+                    sticker_file = await message.sticker.get_file()
+                    file_bytes = await sticker_file.download_as_bytearray()
+                    lottie_json_data = gzip.decompress(file_bytes).decode('utf-8')
+
+                    with LottieAnimation.from_data(lottie_json_data) as animation:
+                        frame_count = animation.lottie_animation_get_totalframe()
+                        num_frames_to_capture = min(MAX_ANIMATION_FRAMES, frame_count)
+
+                        for i in range(num_frames_to_capture):
+                            frame_index = int(i * (frame_count / num_frames_to_capture)) if num_frames_to_capture > 1 else 0
+                            img = animation.render_pillow_frame(frame_num=frame_index)
+                            
+                            with BytesIO() as bio:
+                                img.save(bio, format='PNG')
+                                bio.seek(0)
+                                frame_bytes = bio.read()
+                            
+                            base64_image = base64.b64encode(frame_bytes).decode("utf-8")
+                            media_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                            })
+
+                    logger.info(f"Chat {chat_id}: Extracted {len(media_parts)} frames from animated sticker.")
+                except Exception as e:
+                    logger.error(f"Chat {chat_id}: Failed to process animated sticker: {e}", exc_info=True)
+                    appended_text += "\n\n[INFO: An animated sticker was sent, but an error occurred while processing its frames.]"
+
+            # --- Handling for Video Stickers (.webm) ---
+            elif message.sticker.is_video:
+                has_image = True
+                logger.info(f"Chat {chat_id}: Processing video sticker (.webm).")
+                temp_video_path = None
+                cap = None
+                try:
+                    sticker_file = await message.sticker.get_file()
+                    temp_video_path = f"temp_{sticker_file.file_unique_id}.webm"
+                    await sticker_file.download_to_drive(custom_path=temp_video_path)
+                    
+                    cap = cv2.VideoCapture(temp_video_path)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    num_frames_to_capture = min(MAX_ANIMATION_FRAMES, frame_count)
+
+                    if num_frames_to_capture > 0:
+                        captured_frames = 0
+                        for i in range(num_frames_to_capture):
+                            frame_index = int(i * (frame_count / num_frames_to_capture)) if num_frames_to_capture > 1 else 0
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                            ret, frame = cap.read()
+                            if ret:
+                                _, buffer = cv2.imencode('.png', frame)
+                                base64_image = base64.b64encode(buffer).decode("utf-8")
+                                media_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}})
+                                captured_frames += 1
+                        logger.info(f"Chat {chat_id}: Extracted {captured_frames} frames from video sticker.")
+                except Exception as e:
+                    logger.error(f"Chat {chat_id}: Failed to process video sticker: {e}", exc_info=True)
+                    appended_text += "\n\n[INFO: A video sticker was sent, but an error occurred while processing its frames.]"
+                finally:
+                    if cap: cap.release()
+                    if temp_video_path and os.path.exists(temp_video_path):
+                        os.remove(temp_video_path)
+
+            # --- Handling for Static Stickers (.webp) ---
+            else:
+                has_image = True
+                sticker_file = await message.sticker.get_file()
+                file_bytes = await sticker_file.download_as_bytearray()
+                base64_image = base64.b64encode(file_bytes).decode("utf-8")
+                mime_type = mimetypes.guess_type(sticker_file.file_path or "sticker.webp")[0] or "image/webp"
+                media_parts.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
-                }
-            )
-            logger.info(f"Chat {chat_id}: Added image_url from static sticker.")
-        else:
-            # If the sticker is animated, we can't send it to the AI as an image.
-            # Instead, we'll just add a text note about it for context.
-            appended_text += "\n\n[INFO: An animated sticker was sent. Unfortunately, only static images can be processed, not animations.]"
-            logger.info(
-                f"Chat {chat_id}: Ignored animated/video sticker for image processing."
-            )
+                })
+                logger.info(f"Chat {chat_id}: Added image_url from static sticker.")
 
     # 2. Process Voice message
     if message.voice:
@@ -2426,131 +2827,189 @@ async def _process_media_and_documents(
         try:
             voice_file = await message.voice.get_file()
             if voice_file.file_path:
-                media_parts.append(
-                    {"type": "audio_url", "audio_url": {"url": voice_file.file_path}}
-                )
-                logger.info(
-                    f"Chat {chat_id}: Added audio_url from voice object: {voice_file.file_path}"
-                )
+                media_parts.append({"type": "audio_url", "audio_url": {"url": voice_file.file_path}})
+                logger.info(f"Chat {chat_id}: Added audio_url from voice object: {voice_file.file_path}")
             else:
-                logger.warning(
-                    f"Chat {chat_id}: Could not get file_path for voice message."
-                )
+                logger.warning(f"Chat {chat_id}: Could not get file_path for voice message.")
         except Exception as e:
-            logger.error(
-                f"Chat {chat_id}: Error processing voice message: {e}", exc_info=True
-            )
+            logger.error(f"Chat {chat_id}: Error processing voice message: {e}", exc_info=True)
 
-    # 3. Process Document (could be an image, audio, or text file)
+    # Process Animation (GIFs from search panel, often sent as MP4)
+    if anim := message.animation:
+        anim_name = anim.file_name or "animation.mp4"
+        if anim.file_size and anim.file_size > MAX_IMAGE_FILE_SIZE:
+            logger.warning(f"Chat {chat_id}: Ignoring animation '{anim_name}' ({(anim.file_size / 1024 / 1024):.2f} MB) due to size limit.")
+            appended_text += f"\n\n[INFO: An attached animation '{anim_name}' was ignored because it is too large.]"
+        else:
+            has_image = True
+            logger.info(f"Chat {chat_id}: Processing Animation object '{anim_name}'.")
+            temp_video_path = None
+            cap = None
+            try:
+                anim_file = await anim.get_file()
+                temp_video_path = f"temp_{anim_file.file_unique_id}.mp4"
+                await anim_file.download_to_drive(custom_path=temp_video_path)
+                
+                cap = cv2.VideoCapture(temp_video_path)
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                num_frames_to_capture = min(MAX_ANIMATION_FRAMES, frame_count)
+
+                if num_frames_to_capture > 0:
+                    captured_frames = 0
+                    for i in range(num_frames_to_capture):
+                        frame_index = int(i * (frame_count / num_frames_to_capture)) if num_frames_to_capture > 1 else 0
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                        ret, frame = cap.read()
+                        if ret:
+                            _, buffer = cv2.imencode('.png', frame)
+                            base64_image = base64.b64encode(buffer).decode("utf-8")
+                            media_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}})
+                            captured_frames += 1
+                    logger.info(f"Chat {chat_id}: Extracted {captured_frames} frames from Animation object.")
+            except Exception as e:
+                logger.error(f"Chat {chat_id}: Failed to process Animation '{anim_name}': {e}", exc_info=True)
+                appended_text += f"\n\n[INFO: A GIF animation '{anim_name}' was sent, but an error occurred while processing its frames.]"
+            finally:
+                if cap: cap.release()
+                if temp_video_path and os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+
+    # Handle videos
+    if video := message.video:
+        video_name = video.file_name or "video.mp4"
+        if video.file_size and video.file_size > MAX_IMAGE_FILE_SIZE: # Re-using image size limit
+            logger.warning(f"Chat {chat_id}: Ignoring video '{video_name}' ({(video.file_size / 1024 / 1024):.2f} MB) due to size limit.")
+            appended_text += f"\n\n[INFO: An attached video '{video_name}' was ignored because it is too large.]"
+        else:
+            has_image = True # We are processing it into image frames
+            logger.info(f"Chat {chat_id}: Processing Video object '{video_name}'.")
+            temp_video_path = None
+            cap = None
+            try:
+                video_file = await video.get_file()
+                temp_video_path = f"temp_{video_file.file_unique_id}.mp4"
+                await video_file.download_to_drive(custom_path=temp_video_path)
+                
+                cap = cv2.VideoCapture(temp_video_path)
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                num_frames_to_capture = min(MAX_ANIMATION_FRAMES, frame_count)
+
+                if num_frames_to_capture > 0:
+                    captured_frames = 0
+                    for i in range(num_frames_to_capture):
+                        # Distribute frame captures across the video's duration
+                        frame_index = int(i * (frame_count / num_frames_to_capture)) if num_frames_to_capture > 1 else 0
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                        ret, frame = cap.read()
+                        if ret:
+                            _, buffer = cv2.imencode('.png', frame)
+                            base64_image = base64.b64encode(buffer).decode("utf-8")
+                            media_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}})
+                            captured_frames += 1
+                    logger.info(f"Chat {chat_id}: Extracted {captured_frames} frames from Video object.")
+            except Exception as e:
+                logger.error(f"Chat {chat_id}: Failed to process Video '{video_name}': {e}", exc_info=True)
+                appended_text += f"\n\n[INFO: A video file '{video_name}' was sent, but an error occurred while processing its frames.]"
+            finally:
+                if cap:
+                    cap.release()
+                if temp_video_path and os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+
+    # 3. Process Document (could be an image, audio, GIF, or text file)
     if doc := message.document:
         doc_mime = doc.mime_type or "application/octet-stream"
         doc_name = doc.file_name or "file"
 
-        if doc_mime.startswith("image/"):
-            has_image = True
-            doc_file = await doc.get_file()
-            file_bytes = await doc_file.download_as_bytearray()
-            base64_image = base64.b64encode(file_bytes).decode("utf-8")
-            media_parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{doc_mime};base64,{base64_image}"},
-                }
-            )
-            logger.info(f"Chat {chat_id}: Added image_url from document '{doc_name}'.")
+        # --- Handling for GIFs sent as documents ---
+        if doc_mime == "image/gif":
+            if doc.file_size and doc.file_size > MAX_IMAGE_FILE_SIZE:
+                logger.warning(f"Chat {chat_id}: Ignoring GIF document '{doc_name}' ({(doc.file_size / 1024 / 1024):.2f} MB) due to size limit.")
+                appended_text += f"\n\n[INFO: An attached GIF file '{doc_name}' was ignored because it is too large.]"
+            else:
+                has_image = True
+                logger.info(f"Chat {chat_id}: Processing GIF document '{doc_name}'.")
+                try:
+                    file_bytes = await (await doc.get_file()).download_as_bytearray()
+                    with Image.open(BytesIO(file_bytes)) as img:
+                        if img.is_animated:
+                            frame_count = img.n_frames
+                            num_frames_to_capture = min(MAX_ANIMATION_FRAMES, frame_count)
+                            if num_frames_to_capture > 0:
+                                for i in range(num_frames_to_capture):
+                                    frame_index = int(i * (frame_count / num_frames_to_capture)) if num_frames_to_capture > 1 else 0
+                                    img.seek(frame_index)
+                                    with BytesIO() as bio:
+                                        img.convert("RGBA").save(bio, format='PNG')
+                                        bio.seek(0)
+                                        frame_bytes = bio.read()
+                                    base64_image = base64.b64encode(frame_bytes).decode("utf-8")
+                                    media_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}})
+                                logger.info(f"Chat {chat_id}: Extracted {num_frames_to_capture} frames from GIF.")
+                except Exception as e:
+                    logger.error(f"Chat {chat_id}: Failed to process GIF '{doc_name}': {e}", exc_info=True)
+                    appended_text += f"\n\n[INFO: A GIF file '{doc_name}' was sent, but an error occurred while processing its frames.]"
+        
+        # --- Handling for other images ---
+        elif doc_mime.startswith("image/"):
+            if doc.file_size and doc.file_size > MAX_IMAGE_FILE_SIZE:
+                logger.warning(f"Chat {chat_id}: Ignoring image document '{doc_name}' ({(doc.file_size / 1024 / 1024):.2f} MB) due to size limit.")
+                appended_text += f"\n\n[INFO: An attached image file '{doc_name}' was ignored because it is too large.]"
+            else:
+                has_image = True
+                file_bytes = await (await doc.get_file()).download_as_bytearray()
+                base64_image = base64.b64encode(file_bytes).decode("utf-8")
+                media_parts.append({"type": "image_url", "image_url": {"url": f"data:{doc_mime};base64,{base64_image}"}})
+                logger.info(f"Chat {chat_id}: Added image_url from document '{doc_name}'.")
 
+        # --- Handling for audio ---
         elif doc_mime.startswith("audio/"):
             has_voice = True
             try:
                 doc_file = await doc.get_file()
                 if doc_file.file_path:
-                    media_parts.append(
-                        {"type": "audio_url", "audio_url": {"url": doc_file.file_path}}
-                    )
-                    logger.info(
-                        f"Chat {chat_id}: Added audio_url from document '{doc_name}'."
-                    )
+                    media_parts.append({"type": "audio_url", "audio_url": {"url": doc_file.file_path}})
+                    logger.info(f"Chat {chat_id}: Added audio_url from document '{doc_name}'.")
             except Exception as e:
-                logger.error(
-                    f"Chat {chat_id}: Error processing audio document '{doc_name}': {e}",
-                    exc_info=True,
-                )
-
-        else:  # Attempt to process as a text file
-            docx_mimes = (
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+                logger.error(f"Chat {chat_id}: Error processing audio document '{doc_name}': {e}", exc_info=True)
+        
+        # --- Handling for text-based files ---
+        else:
+            docx_mimes = ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",)
             odt_mimes = ("application/vnd.oasis.opendocument.text",)
-            plain_text_mimes = (
-                "text/",
-                "application/json",
-                "application/xml",
-                "application/javascript",
-            )
-            text_extensions = {
-                ".txt",
-                ".md",
-                ".markdown",
-                ".json",
-                ".xml",
-                ".csv",
-                ".py",
-                ".js",
-                ".html",
-                ".css",
-            }
+            plain_text_mimes = ("text/", "application/json", "application/xml", "application/javascript")
+            text_extensions = {".txt", ".md", ".json", ".xml", ".csv", ".py", ".js", ".html", ".css"}
 
-            is_known_text_mime = (
-                any(doc_mime.startswith(m) for m in plain_text_mimes)
-                or doc_mime in docx_mimes
-                or doc_mime in odt_mimes
-            )
-            is_known_text_ext = doc_name and any(
-                doc_name.lower().endswith(ext) for ext in text_extensions
-            )
+            is_known_text_mime = any(doc_mime.startswith(m) for m in plain_text_mimes) or doc_mime in docx_mimes or doc_mime in odt_mimes
+            is_known_text_ext = doc_name and any(doc_name.lower().endswith(ext) for ext in text_extensions)
 
             if is_known_text_mime or is_known_text_ext:
                 if doc.file_size and doc.file_size > MAX_TEXT_FILE_SIZE:
-                    logger.warning(
-                        f"Chat {chat_id}: Ignoring document '{doc_name}' ({doc.file_size} bytes) due to size limit."
-                    )
+                    logger.warning(f"Chat {chat_id}: Ignoring document '{doc_name}' ({doc.file_size} bytes) due to size limit.")
                     appended_text += f"\n\n[INFO: An attached document '{doc_name}' was ignored because it is too large.]"
                 else:
                     file_content = None
                     try:
-                        file_bytes = await (
-                            await doc.get_file()
-                        ).download_as_bytearray()
+                        file_bytes = await (await doc.get_file()).download_as_bytearray()
                         if doc_mime in docx_mimes:
                             file_stream = BytesIO(file_bytes)
                             doc_obj = docx.Document(file_stream)
-                            file_content = "\n".join(
-                                [p.text for p in doc_obj.paragraphs if p.text.strip()]
-                            )
+                            file_content = "\n".join([p.text for p in doc_obj.paragraphs if p.text.strip()])
                         elif doc_mime in odt_mimes:
                             doc_obj = odf_load(BytesIO(file_bytes))
                             all_paras = doc_obj.getElementsByType(text.P)
-                            file_content = "\n".join(
-                                teletype.extractText(p)
-                                for p in all_paras
-                                if teletype.extractText(p).strip()
-                            )
-                        else:  # Plain text
+                            file_content = "\n".join([teletype.extractText(p) for p in all_paras if teletype.extractText(p).strip()])
+                        else:
                             try:
                                 file_content = file_bytes.decode("utf-8")
                             except UnicodeDecodeError:
-                                file_content = file_bytes.decode("latin-1")
+                                file_content = file_bytes.decode("latin-1", errors="ignore")
                     except Exception as e:
-                        logger.error(
-                            f"Failed to read or parse text file '{doc_name}': {e}",
-                            exc_info=True,
-                        )
+                        logger.error(f"Failed to read or parse text file '{doc_name}': {e}", exc_info=True)
 
                     if file_content is not None:
                         appended_text += f"\n\n[Content of uploaded file '{doc_name}']:\n---\n{file_content.strip()}\n---"
-                        logger.info(
-                            f"Chat {chat_id}: Appended content of text document '{doc_name}'."
-                        )
+                        logger.info(f"Chat {chat_id}: Appended content of text document '{doc_name}'.")
                     else:
                         appended_text += f"\n\n[INFO: Could not extract text from the attached document '{doc_name}'.]"
 
@@ -2653,6 +3112,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
+    # Check for ignored user
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring command from ignored user {update.effective_user.id}.")
+        return
+
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context)
         return
@@ -2696,6 +3160,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+    # Check for ignored user
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring command from ignored user {update.effective_user.id}.")
+        return
+
     message_thread_id: Optional[int] = None
     if update.message and update.message.message_thread_id is not None:
         message_thread_id = update.message.message_thread_id
@@ -2716,10 +3185,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         help_text_parts.append(
             "**/imagine** `<prompt>` - Generate images based on your prompt using Bing."
         )
-        if SETTINGS['BOT_OWNERS'] and str(update.effective_user.id) in SETTINGS['BOT_OWNERS']:
-            help_text_parts.append(
-                "**/setbingcookie** `<cookie_value>` - (Owner) Update the Bing authentication cookie."
-            )
+    # Add owner commands to help text
+    if await is_owner(update):
+            help_text_parts.extend([
+                "\n*--- Owner Commands ---*",
+                "**/stats** - View bot usage statistics.",
+                "**/ignore** `<id> <duration> [reason]` - Block a user.",
+                "**/unignore** `<id>` - Unblock a user.",
+                "**/listignored** - List all blocked users.",
+                "**/viewsettings** - View current bot settings.",
+                "**/setsetting** `<KEY> <value>` - Change a bot setting.",
+                "**/setperchancekey** `<key>` - Set the Perchance API key."
+            ])
+            if BING_IMAGE_CREATOR_AVAILABLE:
+                help_text_parts.append(
+                    "**/setbingcookie** `<cookie>` - Update the Bing auth cookie."
+                )
 
     help_text_parts.append(
         "\nSimply send me a message, an image (with or without a caption), or a voice message to start chatting!"
@@ -2790,6 +3271,11 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring."
             )
             return
+
+    # Check for ignored user
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring command from ignored user {update.effective_user.id}.")
+        return
 
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context)
@@ -2886,6 +3372,11 @@ async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring."
             )
             return
+
+    # Check for ignored user
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring command from ignored user {update.effective_user.id}.")
+        return
 
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context)
@@ -3066,6 +3557,11 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
+    # Check for ignored user
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring command from ignored user {update.effective_user.id}.")
+        return
+
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context)
         return
@@ -3129,6 +3625,11 @@ async def deactivate_command(
                 f"Command '{command_with_potential_mention}' in chat {update.effective_chat.id} (thread {update.message.message_thread_id}) is for another bot. Ignoring."
             )
             return
+
+    # Check for ignored user
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring command from ignored user {update.effective_user.id}.")
+        return
 
     if not is_user_or_chat_allowed(update.effective_user.id, update.effective_chat.id):
         await handle_permission_denied(update, context)
@@ -3364,29 +3865,213 @@ async def set_setting_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Failed to set '{key_to_set}'. Error: {e}")
         logger.error(f"Error setting '{key_to_set}': {e}")
 
-# --- END OF COMMAND HANDLERS ---
+# Owner Commands for Ignore System and Stats
+async def ignore_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) Manually ignores a user."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: /ignore <user_id> <duration> [reason]\nExample: `/ignore 123456 12h spam`")
+        return
+        
+    try:
+        user_id = int(context.args[0])
+        duration_str = context.args[1]
+        reason = " ".join(context.args[2:]) if len(context.args) > 2 else "Manual ignore by owner."
+        
+        # Safety checks
+        if user_id == context.bot.id:
+            await update.message.reply_text("I cannot ignore myself.")
+            return
+        if str(user_id) in SETTINGS.get('BOT_OWNERS', []):
+            await update.message.reply_text("I cannot ignore a bot owner.")
+            return
 
-# --- Main Message Handler ---
-async def process_message_entrypoint(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.message or not update.effective_chat or not update.effective_user:
-        logger.debug("Update missing essential message, chat, or user. Ignoring.")
+        until_date = datetime.now(dt_timezone.utc) + _parse_duration(duration_str)
+        
+        # Update cache and DB
+        ignored_users_cache[user_id] = {'ignored_until': until_date, 'reason': reason}
+        db_manager.add_ignored_user(user_id, until_date, reason)
+        
+        await update.message.reply_text(f"✅ User {user_id} is now ignored until {until_date.strftime('%Y-%m-%d %H:%M UTC')}.")
+        logger.info(f"User {user_id} manually ignored by owner {update.effective_user.id} until {until_date}.")
+        
+    except ValueError:
+        await update.message.reply_text("Invalid User ID or duration format. Use formats like '30m', '6h', '1d'.")
+    except Exception as e:
+        await update.message.reply_text(f"An error occurred: {e}")
+
+async def unignore_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) Manually un-ignores a user."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+        
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: /unignore <user_id>")
+        return
+        
+    try:
+        user_id = int(context.args[0])
+        
+        if user_id in ignored_users_cache:
+            ignored_users_cache.pop(user_id, None)
+            db_manager.remove_ignored_user(user_id)
+            await update.message.reply_text(f"✅ User {user_id} has been un-ignored.")
+            logger.info(f"User {user_id} manually un-ignored by owner {update.effective_user.id}.")
+        else:
+            await update.message.reply_text(f"User {user_id} was not found in the ignore list.")
+            
+    except ValueError:
+        await update.message.reply_text("Invalid User ID.")
+
+async def list_ignored_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) Lists all currently ignored users."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+        
+    if not ignored_users_cache:
+        await update.message.reply_text("The ignore list is currently empty.")
+        return
+        
+    now = datetime.now(dt_timezone.utc)
+    message_parts = ["*Currently Ignored Users:*"]
+    
+    # Prune expired users first
+    expired_users = [uid for uid, info in ignored_users_cache.items() if now > info['ignored_until']]
+    for uid in expired_users:
+        ignored_users_cache.pop(uid, None)
+        db_manager.remove_ignored_user(uid)
+
+    if not ignored_users_cache:
+        await update.message.reply_text("The ignore list is currently empty (after pruning expired entries).")
         return
 
-    if SETTINGS['IGNORE_OLD_MESSAGES_ON_STARTUP'] and BOT_STARTUP_TIMESTAMP:
-        message_date_utc = update.message.date.astimezone(dt_timezone.utc)
-        if message_date_utc < BOT_STARTUP_TIMESTAMP:
-            logger.info(
-                f"Ignoring old message (ID: {update.message.message_id}) from before bot startup."
-            )
-            return
+    for user_id, info in ignored_users_cache.items():
+        time_left = info['ignored_until'] - now
+        hours, remainder = divmod(time_left.total_seconds(), 3600)
+        minutes, _ = divmod(remainder, 60)
+        time_left_str = f"{int(hours)}h {int(minutes)}m"
+        reason = info.get('reason') or 'No reason provided'
+        message_parts.append(f"- `ID: {user_id}` | *Expires in:* {time_left_str} | *Reason:* {reason}")
+        
+    await send_telegramify_message(context, update.effective_chat.id, "\n".join(message_parts), update.message.message_thread_id)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Owner-only) Displays bot usage statistics."""
+    if not await is_owner(update):
+        await update.message.reply_text("🚫 This command is restricted to the bot owner.")
+        return
+    
+    try:
+        # Fetch both sets of stats
+        message_stats = db_manager.get_stats()
+        llm_stats = db_manager.get_llm_stats()
+
+        # Format top groups
+        top_groups_str_parts = []
+        if message_stats['top_groups_30d']:
+            for i, group in enumerate(message_stats['top_groups_30d']):
+                top_groups_str_parts.append(f"  {i+1}. {group['title']} ({group['count']} msgs)")
+        else:
+            top_groups_str_parts.append("  _No group activity in the last 30 days._")
+        top_groups_str = "\n".join(top_groups_str_parts)
+
+        # Combine all stats into one message
+        stats_text = (
+            "*📊 Bot Statistics*\n\n"
+            "*__Message Stats (All-Time)__*\n"
+            f"- *Total Unique Users:* `{message_stats['total_unique_users']}`\n"
+            f"- *Total Groups:* `{message_stats['total_groups']}`\n\n"
+            "*__Message Stats (Last 30 Days)__*\n"
+            f"- *Messages Received:* `{message_stats['messages_received_30d']}`\n"
+            f"- *Messages Sent:* `{message_stats['messages_sent_30d']}`\n\n"
+            "*__Top 5 Active Groups (Last 30 Days)__*\n"
+            f"{top_groups_str}\n\n"
+            
+            # --- LLM STATS SECTION ---
+            "*__LLM & API Statistics (All-Time)__*\n"
+            f"- *Total API Calls:* `{llm_stats.get('total_api_calls', 0)}`\n"
+            f"- *Total Tool Uses:* `{llm_stats.get('total_tool_uses', 0)}`\n"
+            f"- *Premium Sessions:* `{llm_stats.get('premium_sessions', 0)}`\n"
+            f"- *Fallback Model Uses:* `{llm_stats.get('fallback_sessions', 0)}`\n\n"
+            f"- *Prompt Tokens:* `{llm_stats.get('total_prompt_tokens', 0)}`\n"
+            f"- *Completion Tokens:* `{llm_stats.get('total_completion_tokens', 0)}`\n"
+            f"- *Total Tokens:* `{llm_stats.get('total_tokens', 0)}`\n\n"
+            f"- *Last Model Used:* `{llm_stats.get('last_model_used', 'N/A')}`\n"
+            f"- *Most Used Model:* `{llm_stats.get('most_used_model', 'N/A')}`"
+        )
+        
+        await send_telegramify_message(context, update.effective_chat.id, stats_text, update.message.message_thread_id)
+
+    except Exception as e:
+        logger.error(f"Error generating stats: {e}", exc_info=True)
+        await update.message.reply_text(f"An error occurred while fetching statistics: {e}")
+
+# --- END OF COMMAND HANDLERS ---
+
+def extract_media_from_text(text: str) -> Tuple[str, List[str], List[str]]:
+    """
+    Parses a string to find and extract Shapes.inc media URLs.
+
+    Args:
+        text: The input string from the AI.
+
+    Returns:
+        A tuple containing:
+        - The cleaned text with media URLs removed.
+        - A list of extracted image URLs.
+        - A list of extracted audio URLs.
+    """
+    if not text:
+        return "", [], []
+
+    img_pattern = re.compile(r"(https://files\.shapes\.inc/api/files/[\w.-]+\.(?:png|jpg|jpeg|gif|webp))\b", re.I)
+    audio_pattern = re.compile(r"(https://files\.shapes\.inc/api/files/[\w.-]+\.(?:mp3|ogg|wav|m4a|flac))\b", re.I)
+
+    # Extract all URLs
+    image_urls = img_pattern.findall(text)
+    audio_urls = audio_pattern.findall(text)
+
+    # Remove all found URLs from the text
+    cleaned_text = img_pattern.sub("", text)
+    cleaned_text = audio_pattern.sub("", cleaned_text)
+    
+    # Clean up artifacts left by markdown links like "[desc]()" which becomes just "desc"
+    cleaned_text = re.sub(r"\[([^\]]*)\]\(\s*\)", r"\1", cleaned_text)
+    # Condense multiple newlines into a single one
+    cleaned_text = re.sub(r"(\r\n|\r|\n){2,}", "\n", cleaned_text).strip()
+
+    return cleaned_text, image_urls, audio_urls
+
+async def _execute_core_processing(
+    messages: List[TelegramMessage],
+    update: Update, # The original update that triggered the processing
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    The core logic for processing messages. It is designed to handle a list of messages,
+    which can contain a single message or multiple messages from a media group (album).
+    """
+    # The primary message is the first one in the list. In an album, it's the only one that can contain a caption. It provides the main context.
+    primary_message = messages[0]
+
+    if not primary_message or not update.effective_chat or not update.effective_user:
+        logger.debug("Core processing called with invalid primary message or context.")
+        return
 
     chat_id = update.effective_chat.id
     current_user = update.effective_user
     chat_type = update.effective_chat.type
 
-    raw_current_message_thread_id: Optional[int] = update.message.message_thread_id
+    # Log outgoing message for stats at the end of this function
+    # We define it here to use in the finally block
+    has_sent_response = False
+
+    raw_current_message_thread_id: Optional[int] = primary_message.message_thread_id
 
     # --- Determine effective_topic_context_id (for HISTORY, LOGS, LOCKING, API CHANNEL) ---
     # This ID defines the conversational context.
@@ -3394,10 +4079,10 @@ async def process_message_entrypoint(
     effective_topic_context_id: Optional[int] = raw_current_message_thread_id
 
     if update.effective_chat.is_forum and SETTINGS['SEPARATE_TOPIC_HISTORIES']:
-        is_current_msg_topic_msg = update.message.is_topic_message # True if in a specific user-created topic
+        is_current_msg_topic_msg = primary_message.is_topic_message # True if in a specific user-created topic
         is_reply_to_classic_general = (
-            update.message.reply_to_message
-            and update.message.reply_to_message.message_thread_id is None # "Classic General" has no thread_id on replies to it
+            primary_message.reply_to_message
+            and primary_message.reply_to_message.message_thread_id is None # "Classic General" has no thread_id on replies to it
         )
         if is_reply_to_classic_general:
             # If replying to a message in the "classic General" (where its thread_id is None),
@@ -3425,22 +4110,13 @@ async def process_message_entrypoint(
 
     # --- Determine effective_send_thread_id for SENDING REPLIES ---
     effective_send_thread_id: Optional[int] = raw_current_message_thread_id
-
-    if update.message.reply_to_message:
-        effective_send_thread_id = update.message.reply_to_message.message_thread_id
-        # logger.debug(f"SEND THREAD ID: Message is a reply. Using replied message's thread_id: {effective_send_thread_id}.")
-
+    if primary_message.reply_to_message:
+        effective_send_thread_id = primary_message.reply_to_message.message_thread_id
     if update.effective_chat.is_forum:
-        if not update.message.is_topic_message:  # Current message is in General
-            # if effective_send_thread_id is not None:
-            # logger.debug(f"SEND THREAD ID (Forum General Correction): Current message in General. Overriding send thread to None. (Original: {effective_send_thread_id})")
-            effective_send_thread_id = None
-        elif (
-            update.message.reply_to_message
-            and update.message.reply_to_message.message_thread_id is None
-        ):  # Replying to classic General
-            # if effective_send_thread_id is not None:
-            # logger.debug(f"SEND THREAD ID (Forum General Correction): Replying to classic General. Overriding send thread to None. (Original: {effective_send_thread_id})")
+        if not primary_message.is_topic_message or (
+            primary_message.reply_to_message
+            and primary_message.reply_to_message.message_thread_id is None
+        ):
             effective_send_thread_id = None
 
     logger.info(
@@ -3464,41 +4140,6 @@ async def process_message_entrypoint(
     async with lock:
         logger.info(f"Lock acquired for context key: {lock_key}. Processing message...")
         try:
-            user_message_text_original = update.message.text or ""
-            user_message_caption_original = update.message.caption or ""
-            replied_msg = update.message.reply_to_message
-
-            log_media_description = ""
-            if update.message.photo:
-                log_media_description = "[Image]"
-            elif update.message.sticker:
-                log_media_description = "[Sticker]"
-            elif update.message.voice:
-                log_media_description = "[Voice Message]"
-            elif doc_ := update.message.document:
-                doc_name_ = doc_.file_name or "file"
-                if doc_.mime_type and doc_.mime_type.startswith("image/"):
-                    log_media_description = f"[Image File: {doc_name_}]"
-                elif doc_.mime_type and doc_.mime_type.startswith("audio/"):
-                    log_media_description = f"[Audio File: {doc_name_}]"
-                else:
-                    log_media_description = f"[Document: {doc_name_}]"
-            elif not (user_message_text_original or user_message_caption_original):
-                log_media_description = "[Unsupported or Empty Message Type]"
-
-            current_message_content_for_raw_log = (
-                user_message_text_original
-                or user_message_caption_original
-                or log_media_description
-            )
-            if chat_type in [Chat.GROUP, Chat.SUPERGROUP]:
-                add_to_raw_group_log(
-                    chat_id,
-                    effective_topic_context_id,
-                    get_display_name(current_user),
-                    current_message_content_for_raw_log,
-                )
-
             if not is_user_or_chat_allowed(current_user.id, chat_id):
                 return
 
@@ -3511,7 +4152,7 @@ async def process_message_entrypoint(
             ) = (False, False, False, False, False)
             bot_username_at = f"@{context.bot.username}"
             text_for_trigger_check = (
-                user_message_text_original or user_message_caption_original
+                primary_message.text or primary_message.caption or ""
             )
             current_chat_topic_key_for_activation = (
                 chat_id,
@@ -3524,9 +4165,9 @@ async def process_message_entrypoint(
                 if current_chat_topic_key_for_activation in activated_chats_topics:
                     should_process_message, is_activated_chat_topic = True, True
                 elif (
-                    replied_msg
-                    and replied_msg.from_user
-                    and replied_msg.from_user.id == context.bot.id
+                    primary_message.reply_to_message
+                    and primary_message.reply_to_message.from_user
+                    and primary_message.reply_to_message.from_user.id == context.bot.id
                 ):
                     should_process_message, is_direct_reply_to_bot = True, True
                 elif bot_username_at in text_for_trigger_check:
@@ -3545,15 +4186,26 @@ async def process_message_entrypoint(
 
             llm_history = get_llm_chat_history(chat_id, effective_topic_context_id)
             user_content_parts_for_llm: List[Dict[str, Any]] = []
+            appended_file_content_str = ""
+            has_image_from_current = False
+            has_voice_from_current = False
 
-            (
-                has_image_from_current,
-                has_voice_from_current,
-                appended_file_content_str,
-                current_media_parts,
-            ) = await _process_media_and_documents(update.message)
-            user_content_parts_for_llm.extend(current_media_parts)
+            for msg in messages:
+                (
+                    has_img,
+                    has_voice,
+                    appended_text,
+                    media_parts,
+                ) = await _process_media_and_documents(msg)
+                user_content_parts_for_llm.extend(media_parts)
+                if appended_text:
+                    appended_file_content_str += appended_text
+                if has_img:
+                    has_image_from_current = True
+                if has_voice:
+                    has_voice_from_current = True
 
+            replied_msg = primary_message.reply_to_message
             if replied_msg and not is_free_will_triggered:
                 (
                     replied_has_image,
@@ -3573,6 +4225,8 @@ async def process_message_entrypoint(
                     appended_file_content_str += replied_doc_text
 
             base_text_for_llm = ""
+            user_message_text_original = primary_message.text or ""
+            user_message_caption_original = primary_message.caption or ""
             current_speaker_display_name = get_display_name(current_user)
             known_topic_name_for_context = (
                 topic_names_cache.get((chat_id, effective_topic_context_id))
@@ -3586,26 +4240,19 @@ async def process_message_entrypoint(
                     author = get_display_name(replied_msg.from_user)
                     content = replied_msg.text or replied_msg.caption or ""
                     if not content:
-                        if replied_msg.photo or (
-                            replied_msg.document
-                            and replied_msg.document.mime_type
-                            and replied_msg.document.mime_type.startswith("image/")
-                        ):
-                            content = "[Image]"
-                        elif replied_msg.voice or (
-                            replied_msg.document
-                            and replied_msg.document.mime_type
-                            and replied_msg.document.mime_type.startswith("audio/")
-                        ):
-                            content = "[Voice Message]"
-                        elif replied_msg.document:
-                            content = f"[Document: {replied_msg.document.file_name or 'file'}]"
-                        else:
-                            content = "[message with no text content]"
+                        if replied_msg.photo: content = "[Image]"
+                        elif sticker := replied_msg.sticker:
+                            if sticker.is_animated: content = f"[Animated Sticker: {sticker.emoji or 'animation'}]"
+                            elif sticker.is_video: content = f"[Video Sticker: {sticker.emoji or 'video'}]"
+                            else: content = f"[Static Sticker: {sticker.emoji or 'image'}]"
+                        elif replied_msg.voice: content = "[Voice Message]"
+                        elif doc := replied_msg.document:
+                            content = f"[Document: {doc.file_name or 'file'}]"
+                        else: content = "[message with no text content]"
                     replied_to_info = {"author": author, "content": content}
                 base_text_for_llm = format_freewill_context_from_raw_log(
                     chat_id,
-                    effective_topic_context_id,
+                    effective_send_thread_id,
                     SETTINGS['GROUP_FREE_WILL_CONTEXT_MESSAGES'],
                     context.bot.username or SETTINGS['SHAPESINC_SHAPE_USERNAME'],
                     update.effective_chat.title,
@@ -3621,14 +4268,14 @@ async def process_message_entrypoint(
                         if update.effective_chat.title
                         else []
                     )
-                    if effective_topic_context_id is not None:
+                    if effective_send_thread_id is not None:
                         parts.append(
                             f"with topic name '{known_topic_name_for_context}'"
                             if known_topic_name_for_context
-                            else f"with topic ID '{effective_topic_context_id}'"
+                            else f"with topic ID '{effective_send_thread_id}'"
                         )
                     elif update.effective_chat.title:
-                        parts.append("the general chat area")
+                        parts.append("in the general chat area")
                     location_addon = f" {' '.join(parts)}" if parts else ""
                 elif chat_type == Chat.PRIVATE:
                     location_addon = " in a private chat"
@@ -3677,23 +4324,16 @@ async def process_message_entrypoint(
                         author = get_display_name(replied_msg.from_user)
                         desc = replied_msg.text or replied_msg.caption or ""
                         if not desc:
-                            if replied_msg.photo:
-                                desc = "[Image]"
-                            elif replied_msg.voice:
-                                desc = "[Voice Message]"
-                            elif replied_msg.document:
-                                doc_name = replied_msg.document.file_name or "file"
-                                if (
-                                    replied_msg.document.mime_type
-                                    and replied_msg.document.mime_type.startswith(
-                                        "image/"
-                                    )
-                                ):
-                                    desc = f"[Image File: {doc_name}]"
-                                else:
-                                    desc = f"[Document: {doc_name}]"
-                            else:
-                                desc = "[non-text/media message]"
+                            if replied_msg.photo: desc = "[Image]"
+                            elif replied_msg.animation: desc = "[GIF Animation]"
+                            elif sticker := replied_msg.sticker:
+                                if sticker.is_animated: desc = f"[Animated Sticker: {sticker.emoji or 'animation'}]"
+                                elif sticker.is_video: desc = f"[Video Sticker: {sticker.emoji or 'video'}]"
+                                else: desc = f"[Static Sticker: {sticker.emoji or 'image'}]"
+                            elif replied_msg.voice: desc = "[Voice Message]"
+                            elif doc := replied_msg.document:
+                                desc = f"[Document: {doc.file_name or 'file'}]"
+                            else: desc = "[message with no text content]"
                         author_id_desc = (
                             f"'{author}'"
                             if not (
@@ -3710,9 +4350,15 @@ async def process_message_entrypoint(
                             f"Chat {chat_id}: Bot addressed in reply to ignorable service message. Suppressing reply context."
                         )
 
+                # Build the text part of the prompt step-by-step for clarity and robustness.
+                text_parts_for_llm = [speaker_context_prefix, reply_context_prefix]
+
+                # Get the actual text from the user's current message
                 actual_user_text = (
                     user_message_text_original or user_message_caption_original
                 )
+                
+                # If the bot was mentioned, remove the mention to clean up the prompt
                 if is_mention_to_bot and bot_username_at in actual_user_text:
                     actual_user_text = re.sub(
                         r"\s*" + re.escape(bot_username_at) + r"\s*",
@@ -3721,19 +4367,25 @@ async def process_message_entrypoint(
                         count=1,
                         flags=re.IGNORECASE,
                     ).strip()
-                    if not actual_user_text and (
-                        user_message_text_original or user_message_caption_original
-                    ):
-                        actual_user_text = "(You were addressed directly)"
-                base_text_for_llm = (
-                    speaker_context_prefix + reply_context_prefix + actual_user_text
-                )
+
+                # Add the user's text to our list of parts if it exists
+                if actual_user_text:
+                    text_parts_for_llm.append(actual_user_text)
+                # Handle the edge case where a user just pings the bot with no other text
+                elif is_mention_to_bot:
+                    text_parts_for_llm.append("(You were addressed directly)")
+
+                # Handle the special case where a user replies with no new text or media
                 if (
                     not actual_user_text
                     and not has_image_from_current
                     and not has_voice_from_current
+                    and replied_msg
                 ):
-                    base_text_for_llm += "(This was a reply with no new text/media)"
+                    text_parts_for_llm.append("(This was a reply with no new text/media)")
+                
+                # Join all the parts together into the final base text
+                base_text_for_llm = "".join(text_parts_for_llm)
 
             full_text_for_llm = (
                 base_text_for_llm.strip() + appended_file_content_str
@@ -3755,9 +4407,8 @@ async def process_message_entrypoint(
             ):
                 logger.warning(f"Chat {chat_id}: No valid content for LLM. Skipping.")
                 if not is_free_will_triggered:
-                    await update.message.reply_text(
-                        "I'm not sure how to respond to that.",
-                        message_thread_id=effective_send_thread_id,
+                    await primary_message.reply_text(
+                        "I'm not sure how to respond to that."
                     )
                 return
 
@@ -3780,9 +4431,8 @@ async def process_message_entrypoint(
             ):
                 logger.warning(f"Chat {chat_id}: Final LLM content empty. Not sending.")
                 if not is_free_will_triggered:
-                    await update.message.reply_text(
-                        "I didn't get any content to process.",
-                        message_thread_id=effective_send_thread_id,
+                    await primary_message.reply_text(
+                        "I didn't get any content to process."
                     )
                 return
 
@@ -3913,9 +4563,35 @@ async def process_message_entrypoint(
                         logger.info(
                             f"API Call (Attempt {empty_retry_count+1}, Tool Iter {current_iteration}) for chat {chat_id} (context_id {effective_topic_context_id}). Tool choice: {api_params.get('tool_choice', 'N/A')}."
                         )
+                        
+                        start_time = time.monotonic()
                         response_from_ai = await client_for_this_request.chat.completions.create(
                             **api_params, extra_headers=custom_headers_for_api
                         )
+                        end_time = time.monotonic()
+                        duration_ms = int((end_time - start_time) * 1000)
+                        
+                        # Log the stats to the new database table
+                        try:
+                            if response_from_ai.usage:
+                                # Safely extract metadata
+                                metadata = response_from_ai.usage.metadata or {}
+                                is_premium = metadata.get('is_premium', False)
+                                fallback_used = metadata.get('fallback_model_used', False)
+
+                                db_manager.log_llm_request(
+                                    chat_id=chat_id,
+                                    user_id=current_user.id,
+                                    model=response_from_ai.model,
+                                    usage=response_from_ai.usage.model_dump(),
+                                    was_tool_call=bool(response_from_ai.choices[0].message.tool_calls),
+                                    duration_ms=duration_ms,
+                                    is_premium=is_premium,
+                                    fallback_used=fallback_used
+                                )
+                        except Exception as e_log:
+                            logger.error(f"Failed to log LLM stats for chat {chat_id}: {e_log}")
+
                         ai_msg_obj = response_from_ai.choices[0].message
                         llm_history.append(ai_msg_obj.model_dump(exclude_none=True))
                         db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
@@ -3976,6 +4652,8 @@ async def process_message_entrypoint(
                                             "create_poll_in_chat",
                                             "restrict_user_in_chat",
                                             "get_user_info",
+                                            "get_chat_info",
+                                            "manage_ignored_user",
                                             "generate_anime_image",
                                         ]:
                                             tool_kwargs.update(
@@ -4029,13 +4707,7 @@ async def process_message_entrypoint(
                             logger.warning(
                                 f"Chat {chat_id}: AI response (iter {current_iteration}) had no tool_calls and content was None."
                             )
-                            text_from_this_iteration = (
-                                "AI provided an empty response. Please try rephrasing."
-                            )
-                            llm_history[-1] = {
-                                "role": "assistant",
-                                "content": text_from_this_iteration,
-                            }
+                            text_from_this_iteration = "AI provided an empty response."
                             break
 
                     if (
@@ -4060,46 +4732,11 @@ async def process_message_entrypoint(
                     final_text_from_llm_before_media_extraction = (
                         text_from_this_iteration
                     )
-                    image_urls_to_send, audio_urls_to_send = [], []
-                    text_part_after_media_extraction = (
+
+                    # Use the new helper function for validation
+                    text_part_after_media_extraction, image_urls_to_send, audio_urls_to_send = extract_media_from_text(
                         final_text_from_llm_before_media_extraction
                     )
-                    img_pattern = re.compile(
-                        r"(https://files\.shapes\.inc/[\w.-]+\.(?:png|jpg|jpeg|gif|webp))\b",
-                        re.I,
-                    )
-                    audio_pattern = re.compile(
-                        r"(https://files\.shapes\.inc/[\w.-]+\.(?:mp3|ogg|wav|m4a|flac))\b",
-                        re.I,
-                    )
-                    media_matches = []
-                    for p, t in [(img_pattern, "image"), (audio_pattern, "audio")]:
-                        for m in p.finditer(text_part_after_media_extraction):
-                            media_matches.append({"match": m, "type": t})
-                    media_matches.sort(key=lambda item: item["match"].start())
-                    plain_segments, last_idx_media = [], 0
-                    for item in media_matches:
-                        match, url = item["match"], item["match"].group(0)
-                        plain_segments.append(
-                            text_part_after_media_extraction[
-                                last_idx_media : match.start()
-                            ]
-                        )
-                        if item["type"] == "image":
-                            image_urls_to_send.append(url)
-                        else:
-                            audio_urls_to_send.append(url)
-                        last_idx_media = match.end()
-                    plain_segments.append(
-                        text_part_after_media_extraction[last_idx_media:]
-                    )
-                    text_part_after_media_extraction = "".join(plain_segments)
-                    text_part_after_media_extraction = re.sub(
-                        r"\[([^\]]*)\]\(\s*\)", r"\1", text_part_after_media_extraction
-                    )
-                    text_part_after_media_extraction = re.sub(
-                        r"(\r\n|\r|\n){2,}", "\n", text_part_after_media_extraction
-                    ).strip()
 
                     if (
                         (not text_part_after_media_extraction.strip() or text_part_after_media_extraction.strip().lower() == "ext")
@@ -4130,14 +4767,6 @@ async def process_message_entrypoint(
                         f"Chat {chat_id} (context_id {effective_topic_context_id}): Final AI text empty. Defaulting to error msg."
                     )
                     error_text = "I'm sorry, I couldn't generate a valid response. Please try again."
-                    if llm_history:
-                        llm_history.append(
-                            {
-                                "role": "assistant",
-                                "content": error_text,
-                            }
-                        )
-                    # Send the error message directly
                     await send_message_to_chat_or_general(
                         context.bot,
                         chat_id,
@@ -4149,28 +4778,11 @@ async def process_message_entrypoint(
                     if typing_task and not typing_task.done():
                         typing_task.cancel()  # Cancel "typing..." before we start sending content.
 
+                    has_sent_response = True # for stats logging
+
                     logger.info(
                         f"Chat {chat_id} (context_id {effective_topic_context_id}, send_thread_id {effective_send_thread_id}): AI Response for user: >>>{final_text_from_llm_before_media_extraction[:120].replace(chr(10),'/N')}...<<<"
                     )
-
-                    # Manually parse for Shapes.inc media URLs first.
-                    image_urls_to_send, audio_urls_to_send = [], []
-                    text_after_stripping_media = final_text_from_llm_before_media_extraction
-
-                    img_pattern = re.compile(r"(https://files\.shapes\.inc/[\w.-]+\.(?:png|jpg|jpeg|gif|webp))\b", re.I)
-                    audio_pattern = re.compile(r"(https://files\.shapes\.inc/[\w.-]+\.(?:mp3|ogg|wav|m4a|flac))\b", re.I)
-
-                    # Extract and remove image URLs
-                    found_images = img_pattern.findall(text_after_stripping_media)
-                    if found_images:
-                        image_urls_to_send.extend(found_images)
-                        text_after_stripping_media = img_pattern.sub("", text_after_stripping_media).strip()
-
-                    # Extract and remove audio URLs
-                    found_audio = audio_pattern.findall(text_after_stripping_media)
-                    if found_audio:
-                        audio_urls_to_send.extend(found_audio)
-                        text_after_stripping_media = audio_pattern.sub("", text_after_stripping_media).strip()
 
                     # Send the extracted media files.
                     for img_url in image_urls_to_send:
@@ -4191,16 +4803,12 @@ async def process_message_entrypoint(
                             logger.error(f"Failed to send Shapes.inc audio {audio_url}: {e}")
                         await asyncio.sleep(0.5)
 
-                    # Process the *remaining* text with telegramify-markdown.
-                    text_after_stripping_media = re.sub(r"\[([^\]]*)\]\(\s*\)", r"\1", text_after_stripping_media)
-                    text_after_stripping_media = re.sub(r"(\r\n|\r|\n){2,}", "\n", text_after_stripping_media).strip()
-
-                    if text_after_stripping_media:
+                    if text_part_after_media_extraction:
                         # This function now correctly handles the rest of the message.
                         await send_telegramify_message(
                             context,
                             chat_id,
-                            text_after_stripping_media,
+                            text_part_after_media_extraction,
                             effective_send_thread_id,
                         )
                     else:
@@ -4212,157 +4820,199 @@ async def process_message_entrypoint(
                 )
                 err_msg = (
                     "The AI is taking too long (gateway timeout)."
-                    if hasattr(e_ise, "response")
-                    and e_ise.response
-                    and e_ise.response.status_code == 504
+                    if hasattr(e_ise, "response") and e_ise.response and e_ise.response.status_code == 504
                     else "AI service internal error. Try later."
                 )
-                logger.error(
-                    f"{log_ctx_info}: OpenAI InternalServerError: {e_ise}",
-                    exc_info=True,
+                logger.error(f"Chat {chat_id}: OpenAI InternalServerError: {e_ise}", exc_info=True)
+                await send_message_to_chat_or_general(
+                    context.bot, chat_id, err_msg, preferred_thread_id=effective_send_thread_id
                 )
-                if not (
-                    llm_history
-                    and llm_history[-1].get("role") == "assistant"
-                    and llm_history[-1].get("content") == err_msg
-                ):
-                    llm_history.append({"role": "assistant", "content": err_msg})
-                    db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
-                if chat_id:
-                    try:
-                        await send_message_to_chat_or_general(
-                            context.bot,
-                            chat_id,
-                            err_msg,
-                            preferred_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_send_err:
-                        logger.error(f"Error sending ISE msg: {e_send_err}")
-
-            except APITimeoutError as e_timeout:
-                log_ctx_info = (
-                    f"Chat {chat_id} (context_id {effective_topic_context_id})"
+            except APITimeoutError:
+                err_msg = "AI is too slow, request timed out. Try shorter query or later."
+                logger.error(f"Chat {chat_id}: OpenAI APITimeoutError (client-side).", exc_info=True)
+                await send_message_to_chat_or_general(
+                    context.bot, chat_id, err_msg, preferred_thread_id=effective_send_thread_id
                 )
-                err_msg = (
-                    "AI is too slow, request timed out. Try shorter query or later."
-                )
-                logger.error(
-                    f"{log_ctx_info}: OpenAI APITimeoutError (client-side).",
-                    exc_info=True,
-                )
-                if not (
-                    llm_history
-                    and llm_history[-1].get("role") == "assistant"
-                    and llm_history[-1].get("content") == err_msg
-                ):
-                    llm_history.append({"role": "assistant", "content": err_msg})
-                    db_manager.save_history(chat_id, effective_topic_context_id, llm_history)
-                if chat_id:
-                    try:
-                        await send_message_to_chat_or_general(
-                            context.bot,
-                            chat_id,
-                            err_msg,
-                            preferred_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_send_err:
-                        logger.error(f"Error sending Timeout msg: {e_send_err}")
-
             except telegram.error.BadRequest as e_tg_badreq:
-                logger.error(
-                    f"Outer Telegram BadRequest for chat {chat_id} (context_id {effective_topic_context_id}, send_thread_id {effective_send_thread_id}): {e_tg_badreq}. Raw AI: '{final_text_from_llm_before_media_extraction[:200]}'",
-                    exc_info=True,
-                )
+                logger.error(f"Outer Telegram BadRequest for chat {chat_id}: {e_tg_badreq}", exc_info=True)
                 try:
-                    plain_fb = final_text_from_llm_before_media_extraction
-                    if len(plain_fb) <= 4096:
-                        await context.bot.send_message(
-                            chat_id, text=plain_fb, message_thread_id=None
-                        )  # Fallback to general
-                    else:
-                        logger.warning(
-                            f"Chat {chat_id}: Outer plain fallback too long ({len(plain_fb)}), splitting for general."
-                        )
-                        for i, chunk in enumerate(
-                            [
-                                plain_fb[j : j + 4096]
-                                for j in range(0, len(plain_fb), 4096)
-                            ]
-                        ):
-                            hdr = (
-                                f"[Fallback Pt {i+1}/{ (len(plain_fb)+4095)//4096 }]\n"
-                                if len(plain_fb) > 4096
-                                else ""
-                            )
-                            await context.bot.send_message(
-                                chat_id, text=hdr + chunk, message_thread_id=None
-                            )  # Fallback to general
-                            if i < len(plain_fb) // 4096:
-                                await asyncio.sleep(0.5)
-                except Exception as e_fb_send:
-                    logger.error(
-                        f"Chat {chat_id}: Outer plain fallback send failed: {e_fb_send}"
+                    await context.bot.send_message(
+                        chat_id, text=f"FALLBACK:\n\n{final_text_from_llm_before_media_extraction}", message_thread_id=None
                     )
-                    try:
-                        await context.bot.send_message(
-                            chat_id,
-                            "A general error occurred while formatting my response. (OBRF)",
-                            message_thread_id=None,
-                        )  # Fallback to general
-                    except Exception as e_final:
-                        logger.error(f"Even final OBRF message failed: {e_final}")
-
-            except (
-                httpx.NetworkError,
-                httpx.TimeoutException,
-                httpx.ConnectError,
-                telegram.error.NetworkError,
-                telegram.error.TimedOut,
-            ) as e_net:
-                logger.error(
-                    f"Network error for chat {chat_id} (context_id {effective_topic_context_id}): {e_net}",
-                    exc_info=False,
+                except Exception as e_fb_send:
+                    logger.error(f"Chat {chat_id}: Outer plain fallback send failed: {e_fb_send}")
+            except (httpx.NetworkError, httpx.TimeoutException, httpx.ConnectError, telegram.error.NetworkError, telegram.error.TimedOut) as e_net:
+                logger.error(f"Network error for chat {chat_id}: {e_net}", exc_info=False)
+                await send_message_to_chat_or_general(
+                    context.bot, chat_id, "⚠️ Network issues. Try again later.", preferred_thread_id=effective_send_thread_id
                 )
-                if chat_id:
-                    try:
-                        await send_message_to_chat_or_general(
-                            context.bot,
-                            chat_id,
-                            "⚠️ Network issues. Try again later.",
-                            preferred_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_send_net_err:
-                        logger.error(
-                            f"Chat {chat_id}: Failed to send network error notification: {e_send_net_err}"
-                        )
-
             except Exception as e_main:
                 logger.error(
-                    f"General unhandled error in process_msg for chat {chat_id} (context_id {effective_topic_context_id}): {e_main}",
+                    f"General unhandled error in _execute_core_processing for chat {chat_id}: {e_main}",
                     exc_info=True,
                 )
-                if chat_id:
-                    try:
-                        await send_message_to_chat_or_general(
-                            context.bot,
-                            chat_id,
-                            "😵‍💫 Oops! Something went wrong. Try again. (General error, most likely RATE LIMIT! Try using /auth_shapes command if you haven't already.)",
-                            preferred_thread_id=effective_send_thread_id,
-                        )
-                    except Exception as e_send_gen_err:
-                        logger.error(
-                            f"Chat {chat_id}: Failed to send general error notification: {e_send_gen_err}"
-                        )
+                await send_message_to_chat_or_general(
+                    context.bot,
+                    chat_id,
+                    "😵‍💫 Oops! Something went wrong.",
+                    preferred_thread_id=effective_send_thread_id,
+                )
             finally:
                 if typing_task and not typing_task.done():
                     typing_task.cancel()
-                    logger.debug(
-                        f"Chat {chat_id} (context_id {effective_topic_context_id}, send_thread_id {effective_send_thread_id}): Typing task cancelled."
-                    )
         finally:
+            # Log outgoing message for stats
+            if has_sent_response:
+                try:
+                    db_manager.log_message(
+                        chat_id=chat_id,
+                        chat_title=update.effective_chat.title,
+                        user_id=current_user.id,
+                        is_outgoing=True
+                    )
+                except Exception as e_stat:
+                    logger.error(f"Failed to log outgoing stat for chat {chat_id}: {e_stat}")
+
             logger.info(
                 f"Processing finished. Releasing lock for context key: {lock_key}."
             )
+
+
+async def process_media_group_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Gathers all messages from a media group cache after a short delay
+    and sends them to the core processing function together.
+    """
+    job_data = context.job.data
+    media_group_id = job_data["media_group_id"]
+    update = job_data["update"]  # The last update from the group provides context
+
+    async with media_group_lock:
+        messages = media_group_cache.pop(media_group_id, [])
+
+    if not messages:
+        logger.warning(
+            f"Media group job for {media_group_id} ran, but cache was empty or already processed."
+        )
+        return
+
+    messages.sort(key=lambda m: m.message_id)
+
+    logger.info(
+        f"Timer finished. Processing media group {media_group_id} with {len(messages)} items."
+    )
+
+    await _execute_core_processing(messages, update, context)
+
+
+# --- Main Message Handler ---
+async def process_message_entrypoint(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Acts as a dispatcher. It debounces messages that are part of a media group (album)
+    and sends single messages for immediate processing.
+    """
+    if not update.message or not update.effective_user:
+        return
+
+    # Central check for ignored users. This is the main gate.
+    if is_user_ignored(update.effective_user.id):
+        logger.info(f"Ignoring message from ignored user {update.effective_user.id}.")
+        return # Silently drop the update
+
+    # Log incoming message for statistics
+    try:
+        db_manager.log_message(
+            chat_id=update.effective_chat.id,
+            chat_title=update.effective_chat.title,
+            user_id=update.effective_user.id,
+            is_outgoing=False
+        )
+    except Exception as e:
+        logger.error(f"Failed to log incoming stat for chat {update.effective_chat.id}: {e}")
+
+    # --- Raw Logging for Group Context ---
+    if (
+        update.effective_chat
+        and update.effective_user
+        and update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]
+    ):
+        topic_id_for_log = update.message.message_thread_id
+        if update.effective_chat.is_forum and not update.message.is_topic_message:
+            topic_id_for_log = None
+
+        # More descriptive logging for stickers and media
+        log_media_description = ""
+        if update.message.photo:
+            log_media_description = "[Image]"
+        elif update.message.video:
+            log_media_description = f"[Video: {update.message.video.file_name or 'video'}]"
+        elif sticker := update.message.sticker:
+            if sticker.is_animated:
+                log_media_description = f"[Animated Sticker: {sticker.emoji or 'animation'}]"
+            elif sticker.is_video:
+                log_media_description = f"[Video Sticker: {sticker.emoji or 'video'}]"
+            else:
+                log_media_description = f"[Static Sticker: {sticker.emoji or 'image'}]"
+        elif update.message.voice:
+            log_media_description = "[Voice Message]"
+        elif doc_ := update.message.document:
+            doc_name_ = doc_.file_name or "file"
+            if doc_.mime_type and doc_.mime_type.startswith("image/"):
+                log_media_description = f"[Image File: {doc_name_}]"
+            elif doc_.mime_type and doc_.mime_type.startswith("audio/"):
+                log_media_description = f"[Audio File: {doc_name_}]"
+            else:
+                log_media_description = f"[Document: {doc_name_}]"
+        elif not (update.message.text or update.message.caption):
+            log_media_description = "[Unsupported or Empty Message Type]"
+        
+        content_for_log = (
+            update.message.text or update.message.caption or log_media_description
+        )
+
+        add_to_raw_group_log(
+            update.effective_chat.id,
+            topic_id_for_log,
+            get_display_name(update.effective_user),
+            content_for_log,
+        )
+
+    # --- Media Group Handling ---
+    if update.message.media_group_id:
+        media_group_id = str(update.message.media_group_id)
+
+        async with media_group_lock:
+            if media_group_id not in media_group_cache:
+                media_group_cache[media_group_id] = []
+            media_group_cache[media_group_id].append(update.message)
+
+            job_name = f"media_group_{media_group_id}"
+
+            for job in context.job_queue.get_jobs_by_name(job_name):
+                job.schedule_removal()
+
+            context.job_queue.run_once(
+                process_media_group_job,
+                when=0.7,
+                name=job_name,
+                data={
+                    "media_group_id": media_group_id,
+                    "update": update,
+                },
+            )
+        return
+
+    # --- Single Message Handling ---
+    if SETTINGS["IGNORE_OLD_MESSAGES_ON_STARTUP"] and BOT_STARTUP_TIMESTAMP:
+        if update.message.date.astimezone(dt_timezone.utc) < BOT_STARTUP_TIMESTAMP:
+            logger.info(
+                f"Ignoring old single message (ID: {update.message.message_id}) from before bot startup."
+            )
+            return
+
+    await _execute_core_processing([update.message], update, context)
 # --- END OF Main Message Handler ---
 
 # --- ERROR HANDLER ---
@@ -4440,7 +5090,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                 httpx.NetworkError,
                 httpx.TimeoutException,
             ),
-        ):  # Added httpx.TimeoutException
+        ):  # httpx.TimeoutException
             try:
                 # Send a user-friendly HTML message
                 user_error_message = f"<b>Bot Error:</b> <pre>{html.escape(str(context.error))}</pre>\n<i>An unexpected error occurred. The admin has been notified if configured.</i>"
@@ -4579,6 +5229,10 @@ async def post_initialization(application: Application) -> None:
     # Add owner-specific commands to the list if owners are defined
     if SETTINGS.get('BOT_OWNERS'):
         bot_commands.extend([
+            BotCommand("stats", "(Owner) View bot usage statistics."),
+            BotCommand("ignore", "(Owner) Block a user from using the bot."),
+            BotCommand("unignore", "(Owner) Unblock a user."),
+            BotCommand("listignored", "(Owner) List blocked users."),
             BotCommand("viewsettings", "(Owner) View current bot settings."),
             BotCommand("setsetting", "(Owner) Change a bot setting."),
             BotCommand("setperchancekey", "(Owner) Set the Perchance API key.")
@@ -4649,7 +5303,10 @@ if __name__ == "__main__":
     # --- Load other persistent data ---
     # This dictionary is now just a cache, loaded from the DB at startup
     user_auth_tokens: Dict[int, str] = db_manager.load_all_user_tokens()
-    chat_histories = db_manager.load_all_histories()
+    # Load ignored users into the cache
+    ignored_users_cache = db_manager.load_all_ignored_users()
+    # Needs better logic, chat histories become too big with many images and other data, causes out of memory error. For now the stateful shapes API doesnt really need history anyway.
+    #chat_histories = db_manager.load_all_histories()
     activated_chats_topics = db_manager.load_all_activated_topics()
 
     logger.info(f"Loaded {len(user_auth_tokens)} user tokens, {len(chat_histories)} histories, {len(activated_chats_topics)} activations.")
@@ -4703,6 +5360,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("setperchancekey", set_perchance_key_command))
     app.add_handler(CommandHandler("viewsettings", view_settings_command))
     app.add_handler(CommandHandler("setsetting", set_setting_command))
+    app.add_handler(CommandHandler("ignore", ignore_user_command))
+    app.add_handler(CommandHandler("unignore", unignore_user_command))
+    app.add_handler(CommandHandler("listignored", list_ignored_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(auth_conv_handler)
     # Only add imagine/setbingcookie if library is available
     if BING_IMAGE_CREATOR_AVAILABLE:
@@ -4727,9 +5388,11 @@ if __name__ == "__main__":
             (
                 filters.TEXT
                 | filters.PHOTO
+                | filters.VIDEO
                 | filters.VOICE
                 | filters.Sticker.ALL
                 | filters.Document.ALL
+                | filters.ANIMATION
                 | filters.REPLY
             )
             & (~filters.COMMAND)

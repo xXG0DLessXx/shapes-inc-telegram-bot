@@ -10,8 +10,8 @@ x-common-bot-config: &common-bot-config
   deploy: # Resource limits and reservations
     resources:
       limits:
-        cpus: '0.50' # Limit to 50% of one CPU core
-        memory: '256M' # Limit memory usage to 256 MB
+        cpus: '1.00' # Limit to 100% of one CPU core
+        memory: '512M' # Limit memory usage to 512 MB
       #reservations: # Optional: Guarantee these resources
       #  cpus: '0.25' # Reserve 25% of one CPU core
       #  memory: '128M' # Reserve 128 MB of memory

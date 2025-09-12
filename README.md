@@ -3,13 +3,13 @@
 This project is a Python-based Telegram bot that leverages the Shapes.inc platform (an OpenAI-compatible API) for conversational AI. It's designed to be extensible, allowing multiple bot "personalities" to run from the same codebase using Docker Compose and separate environment files.
 
 The bot can:
-*   **Persist its state & settings:** Utilizes a **SQLite database** to save conversation histories, user authentication data, and bot configuration, allowing settings to be changed dynamically and persist through restarts.
+*   **Persist its state & settings:** Utilizes a **SQLite database** to save conversation histories, user authentication data, bot configuration, and now includes **user moderation status (ignored users) and detailed usage statistics**.
 *   **Authenticate Users:** Offers an `/auth_shapes` flow for users to link their Shapes.inc account, enabling personalized API interactions.
 *   Engage in text-based conversations.
-*   Understand and respond to images sent by users (as direct photos or document attachments).
+*   **Process Advanced Media:** Understand and respond to a wide range of media, including static images, **animated stickers (.tgs), video stickers (.webm), GIFs, and videos** by extracting key frames for visual context.
 *   Process voice messages sent by users (as direct voice messages or document attachments).
 *   **Process text from uploaded documents:** Supports `.txt`, `.md`, `.docx`, and `.odt` files.
-*   Utilize tools like a calculator, weather information, web search, creating polls, fetching game deals, moderating users, getting user info, and generating anime-style images.
+*   Utilize tools like a calculator, weather information, web search, creating polls, fetching game deals, moderating users, getting user/chat info, and generating anime-style images.
 *   Potentially generate images using Bing Image Creator (this feature remains experimental).
 *   **Support Telegram Group Topics:**
     *   Maintain independent, **persistent** conversation histories per topic (and the general chat area) if `SEPARATE_TOPIC_HISTORIES` is enabled.
@@ -28,6 +28,8 @@ The bot can:
     *   User authentication tokens obtained from the Shapes.inc authentication flow.
     *   Topic activation settings (`/activate` status).
     *   **Bot configuration**, allowing settings to persist and be changed dynamically.
+    *   **User moderation data**, including a list of ignored (blocked) users and their expiration times.
+    *   **Detailed usage statistics** for messages and LLM API calls.
 *   **Advanced Message Formatting:** Uses the `telegramify-markdown` library to:
     *   Intelligently split long messages without breaking markdown formatting.
     *   Automatically render code blocks as image snippets or file attachments (e.g., `.py`, `.html`).
@@ -38,9 +40,21 @@ The bot can:
     *   Bot settings are loaded from `.env` files at startup and can be **overridden by values stored in the database**.
     *   New `/viewsettings` command to display the current bot configuration securely.
     *   New `/setsetting` command allows bot owners to **change most settings on-the-fly** without restarting the bot. Changes are saved to the database and are persistent.
+*   **Statistics and Analytics (Owner-Only):**
+    *   The bot now logs detailed statistics for every message and LLM API call to its database.
+    *   A new `/stats` command provides a comprehensive overview of usage, including token counts, model usage, API call metrics, user/group activity, and more.
+*   **User Moderation System (Owner-Only & AI Tool):**
+    *   A persistent, database-backed system to ignore (block) users from interacting with the bot for a specified duration.
+    *   New owner commands (`/ignore`, `/unignore`, `/listignored`) for manual user management.
+    *   A new `manage_ignored_user` tool allows the AI to programmatically block users.
 *   **State-Aware API Interaction:** The bot now sends only the most recent message turn to the Shapes.inc API, relying on its stateful nature to reduce network overhead.
 *   **Conversational AI:** Powered by Shapes.inc (via `openai` library targeting a custom base URL).
-*   **Multi-Modal Input:** Can process text, images (direct or as documents), voice messages (direct or as documents), and text-based documents (`.txt`, `.md`, `.docx`, `.odt`).
+*   **Advanced Multi-Modal Input:** Can process text, voice messages, and text-based documents (`.txt`, `.md`, `.docx`, `.odt`), plus a wide range of visual media:
+    *   Static images (photos, stickers, documents).
+    *   **Animated Stickers (.tgs):** Renders keyframes to understand the animation.
+    *   **Video Stickers (.webm):** Extracts keyframes to understand the video loop.
+    *   **GIFs and Videos:** Extracts keyframes from `.mp4` and `.gif` files for visual context.
+    *   **Media Groups (Albums):** Intelligently groups photos/videos sent as an album into a single context before processing.
 *   **Tool Usage (Function Calling):**
     *   `calculator`: Evaluates mathematical expressions.
     *   `get_weather`: Fetches current, hourly, or daily weather forecasts.
@@ -49,6 +63,8 @@ The bot can:
     *   `get_game_deals`: Fetches information about free game giveaways.
     *   `restrict_user_in_chat`: Temporarily mutes a user in the chat.
     *   `get_user_info`: Retrieves comprehensive information about a chat member.
+    *   `get_chat_info`: Retrieves information about the current chat, such as title and member count.
+    *   `manage_ignored_user`: Blocks or unblocks a user from interacting with the bot.
     *   `generate_anime_image`: Generates an anime-style image using Perchance API.
 *   **Image Generation (Experimental):** `/imagine` command using Bing Image Creator (requires `BING_AUTH_COOKIE`).
 *   **Telegram Group Topic Support:**
@@ -73,14 +89,18 @@ The bot can:
 
 *   **Python 3.11** (as per Dockerfile)
 *   **`sqlite3`**: Used for all database operations and data persistence.
-*   **`python-telegram-bot[ext]>=21.1.1,<22.0.0`**: For Telegram Bot API interaction.
-*   **`telegramify-markdown`**: For advanced markdown parsing and message sending.
-*   **`openai>=1.35.7,<2.0.0`**: To interact with the Shapes.inc API.
-*   **`python-dotenv>=1.0.1,<1.1.0`**: For managing environment variables.
+*   **`python-telegram-bot[ext]>=21.11,<22.0`**: For Telegram Bot API interaction.
+*   **`telegramify-markdown[mermaid]==0.5.1`**: For advanced markdown parsing and message sending.
+*   **`openai>=1.107.2,<2.0.0`**: To interact with the Shapes.inc API.
+*   **`python-dotenv>=1.1.0,<1.2.0`**: For managing environment variables.
 *   **`httpx[http2]>=0.27.0,<0.28.0`**: For making HTTP requests.
-*   **`pytz`, `beautifulsoup4`**: Used by weather and web search tools.
-*   **`BingImageCreator`**: (Optional) For the `/imagine` command.
-*   **`python-docx`, `odfpy`**: For reading `.docx` and `.odt` files.
+*   **`pytz>=2025.2,<2026.0`**, **`beautifulsoup4>=4.13.5,<4.14.0`**: Used by weather and web search tools.
+*   **`BingImageCreator>=0.5.0,<0.6.0`**: (Optional) For the `/imagine` command.
+*   **`python-docx>=1.2.0,<2.0.0`**, **`odfpy>=1.4.1,<2.0.0`**: For reading `.docx` and `.odt` files.
+*   **`Pillow>=11.3.0,<11.4.0`**: For basic image processing, especially with GIFs.
+*   **`rlottie-python>=1.3.8,<1.4.0`**: For rendering frames from animated `.tgs` (Lottie) stickers.
+*   **`opencv-python>=4.12.0,<5.0.0`**: For extracting frames from video stickers (`.webm`) and other video formats.
+*   **`numpy>=2.2.0,<2.3.0`**: A core dependency for `opencv-python`.
 *   **Docker & Docker Compose**: For containerization and multi-bot deployment.
 
 ## Prerequisites
@@ -298,6 +318,10 @@ A `bot_data` directory will be created in your project folder, containing the pe
 *   `/activate`: **(Group Admin-only)** Makes the bot respond to every message in the current group/topic.
 *   `/deactivate`: **(Group Admin-only)** Stops the bot from responding to every message in the current group/topic.
 *   `/imagine <prompt>`: (Experimental) Generates images using Bing Image Creator.
+*   `/stats`: **(Bot Owner-only)** View bot usage statistics.
+*   `/ignore <id> <duration> [reason]`: **(Bot Owner-only)** Block a user from interacting with the bot.
+*   `/unignore <id>`: **(Bot Owner-only)** Unblock a user.
+*   `/listignored`: **(Bot Owner-only)** List all currently blocked users.
 *   `/setbingcookie <cookie_value>`: **(Bot Owner-only)** Updates the Bing authentication cookie **and saves it to the database**. Restricted to users listed in `BOT_OWNERS`.
 *   `/viewsettings`: **(Bot Owner-only)** Displays the current bot configuration, hiding sensitive values.
 *   `/setsetting <NAME> <value>`: **(Bot Owner-only)** Changes a setting's value on-the-fly and saves it to the database.
@@ -322,9 +346,11 @@ You can interact with the bot in several ways:
 ## Important Notes & Known Issues
 
 *   **Persistence & Data**: The bot uses a SQLite database. When using Docker, this file is stored in a named volume (`bot_data`) to ensure it persists.
-*   **Admin vs. Owner Controls**: Group-level commands like `/activate` are restricted to **group administrators**. Bot-level administrative commands like `/setbingcookie` are restricted to **bot owners** defined in the `.env` file.
+*   **Admin vs. Owner Controls**: Group-level commands like `/activate` are restricted to **group administrators**. Bot-level administrative commands like `/setbingcookie` or `/ignore` are restricted to **bot owners** defined in the `.env` file.
 *   **Security:** Be very careful with your API keys, bot tokens, and `SHAPESINC_APP_ID`. Do not commit `.env` files containing secrets.
 *   **Code Quality:** As stated, this is "quick and dirty" code. It's functional but could benefit from significant refactoring.
+*   **Advanced Media Processing:** The bot now processes animated/video stickers, GIFs, and videos by extracting a limited number of frames to send to the vision model. This provides context but is not a full video analysis. File size limits are in place to prevent excessive processing.
+*   **Media Group (Album) Handling:** When you send multiple images/videos as an album, the bot will wait a moment to collect all of them before processing them as a single, combined message.
 *   **Anime Image Generation (`generate_anime_image` tool):** This tool uses the Perchance API and requires a `PERCHANCE_USER_KEY`.
 *   **Voice/Audio Message Processing:** The bot sends the Telegram-provided URL for audio messages directly to the Shapes.inc API. The API must be able to access and process these URLs.
 *   **Document Processing:** The bot can extract text from `.txt`, `.md`, `.docx`, and `.odt` files. There's a `MAX_TEXT_FILE_SIZE` limit (default 500KB).
