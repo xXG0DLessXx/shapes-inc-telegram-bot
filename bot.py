@@ -4659,13 +4659,21 @@ async def _execute_core_processing(
                                             "restrict_user_in_chat",
                                             "get_user_info",
                                             "get_chat_info",
-                                            "manage_ignored_user",
                                             "generate_anime_image",
                                         ]:
                                             tool_kwargs.update(
                                                 {
                                                     "telegram_bot_context": context,
                                                     "current_chat_id": chat_id,
+                                                }
+                                            )
+                                        # This second block is for tools that only need the bot context but NOT the chat_id
+                                        elif func_name in [
+                                            "manage_ignored_user",
+                                        ]:
+                                             tool_kwargs.update(
+                                                {
+                                                    "telegram_bot_context": context
                                                 }
                                             )
                                         if func_name in [
